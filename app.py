@@ -1,6 +1,6 @@
 """
 DASHBOARD INTERACTIVO — Estudio de prevalencia de ERC
-Región de la Araucanía, Chile
+Región de la Araucanía, Chile  |  v4.2.14 — CKD-EPI 2021 | Planillas 01-05
 
 Para correr:
     streamlit run app.py
@@ -13,268 +13,898 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy import stats
+from scipy.stats import pearsonr, spearmanr, linregress
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
 from sklearn.metrics import roc_curve, roc_auc_score
 import warnings
+import unicodedata
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 # ═══════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="ERC Araucanía — Dashboard",
+    page_title="ERC Araucanía — Dashboard v4",
     page_icon="🩺",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Paleta
-C_MAIN = '#2E5266'
-C_ACC = '#D9594C'
+# Paleta KDIGO
+C_MAIN  = '#1F3864'
+C_TEAL  = '#2E7D9F'
+C_ACC   = '#C0392B'
+C_OK    = '#4DAF4A'
 C_LIGHT = '#9FC2BA'
-C_GRAY = '#888888'
-C_OK = '#5B8C5A'
-C_PPOO = '#A06D3F'
-C_NOPP = '#658a93'
+C_GRAY  = '#666666'
+C_LGRAY = '#D5DDE8'
+C_PPOO  = '#8B4513'
+C_NOPP  = '#2E7D9F'
+C_RURAL = '#5D4037'
+C_URBAN = '#1565C0'
 
-# CSS personalizado
+# Estadios KDIGO → color
+KDIGO_COLORS = {
+    'G1': '#4DAF4A', 'G2': '#88C640', 'G3a': '#FFDD00',
+    'G3b': '#F28F00', 'G4': '#E83800', 'G5': '#9E0000',
+}
+RISK_COLORS = {
+    'Bajo': '#A8D5A0', 'Moderado': '#FFDD00',
+    'Alto': '#F08C5A', 'Muy alto': '#C53030',
+}
+
+
+def blend_with_white(hex_color, intensity):
+    """Mezcla blanco con un color base. intensity 0=blanco, 1=color pleno."""
+    intensity = max(0, min(1, float(intensity))) if pd.notna(intensity) else 0
+    h = hex_color.lstrip('#')
+    r,g,b = tuple(int(h[i:i+2], 16) for i in (0,2,4))
+    r = int(255*(1-intensity) + r*intensity)
+    g = int(255*(1-intensity) + g*intensity)
+    b = int(255*(1-intensity) + b*intensity)
+    return f'#{r:02X}{g:02X}{b:02X}'
+
 st.markdown("""
 <style>
-    .stMetric { background: #f8f9fa; padding: 10px; border-radius: 6px; border-left: 4px solid #2E5266; }
-    h1 { color: #2E5266; }
-    h2 { color: #2E5266; border-bottom: 2px solid #9FC2BA; padding-bottom: 4px; }
-    h3 { color: #2E5266; }
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"] { background: #f0f2f5; padding: 8px 16px; border-radius: 4px; }
-    .stTabs [aria-selected="true"] { background: #2E5266 !important; color: white !important; }
+    .stMetric { background:#f8f9fa; padding:10px; border-radius:6px;
+                border-left:4px solid #1F3864; }
+    h1 { color:#1F3864; }
+    h2 { color:#1F3864; border-bottom:2px solid #9FC2BA; padding-bottom:4px; }
+    h3 { color:#2E7D9F; }
+    .stTabs [data-baseweb="tab-list"] { gap:6px; }
+    .stTabs [data-baseweb="tab"] { background:#f0f2f5; padding:8px 16px; border-radius:4px; }
+    .stTabs [aria-selected="true"] { background:#1F3864 !important; color:white !important; }
+    .kdigo-badge { display:inline-block; padding:3px 10px; border-radius:12px;
+                   font-weight:bold; font-size:0.85em; }
 </style>
 """, unsafe_allow_html=True)
 
+# ═══════════════════════════════════════════════════════════
+# RURALIDAD
+# ═══════════════════════════════════════════════════════════
+# Valores armonizados con la adenda corregida del informe.
+# Se usa una versión canónica para mostrar nombres propios con tildes,
+# y una clave normalizada para hacer matching robusto contra la planilla.
+RURALIDAD_CANONICA = {
+    'Freire':48.0,'Melipeuco':72.3,'Cholchol':71.8,'Gorbea':42.1,
+    'Curarrehue':78.9,'Cunco':60.4,'Temuco':6.2,'Pitrufquén':38.7,
+    'Pucón':37.0,'Villarrica':34.7,'Padre Las Casas':11.3,
+    'Galvarino':63.2,'Vilcún':66.2,'Lautaro':26.8,
+    'Teodoro Schmidt':64.9,'Loncoche':45.5,'Curacautín':28.3,
+    'Puerto Saavedra':63.7,'Nueva Imperial':48.2,
+    'La Pintana':0.0,'Estación Central':0.0,'La Granja':0.0,
+}
+
+def norm_key(s):
+    if pd.isna(s):
+        return np.nan
+    s = str(s).strip()
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = ' '.join(s.split()).lower()
+    return s
+
+RURALIDAD_NORM = {norm_key(k): v for k, v in RURALIDAD_CANONICA.items()}
+COMUNA_CANONICA_NORM = {norm_key(k): k for k in RURALIDAD_CANONICA.keys()}
+# Alias explícitos para variantes frecuentes de codificación/capitalización.
+COMUNA_ALIAS = {
+    'estacion central': 'Estación Central',
+    'nueva imperial': 'Nueva Imperial',
+    'padre las casas': 'Padre Las Casas',
+    'puerto saavedra': 'Puerto Saavedra',
+    'teodoro schmidt': 'Teodoro Schmidt',
+}
+COMUNA_CANONICA_NORM.update({norm_key(k): v for k, v in COMUNA_ALIAS.items()})
 
 # ═══════════════════════════════════════════════════════════
-# CARGA DE DATOS Y PREPARACIÓN
+# HELPERS ESTADÍSTICOS
 # ═══════════════════════════════════════════════════════════
-@st.cache_data
-def load_data(path):
-    df = pd.read_excel(path, sheet_name='Datos_analisis')
+def wilson(k, n):
+    if n == 0: return (np.nan, np.nan, np.nan)
+    p = k/n; z = 1.96; d = 1 + z*z/n
+    c = (p + z*z/(2*n))/d
+    h = z * np.sqrt(p*(1-p)/n + z*z/(4*n*n))/d
+    return (p*100, (c-h)*100, (c+h)*100)
 
-    # Grupos etarios
-    def age_grp(a):
-        if pd.isna(a): return np.nan
-        if a < 30: return '<30'
-        elif a < 45: return '30-44'
-        elif a < 60: return '45-59'
-        elif a < 75: return '60-74'
-        else: return '≥75'
-    df['Age_group'] = df['Age'].apply(age_grp)
+def format_p(p):
+    if pd.isna(p): return "—"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
 
-    df['Sex_lbl'] = df['Sex'].map({0: 'Mujer', 1: 'Hombre'})
-    df['PPOO_lbl'] = df['¿PPOO?'].map({0: 'No PPOO', 1: 'PPOO'})
+def _holm_adjust(pvals):
+    """Holm-Bonferroni adjustment without extra dependencies."""
+    pvals = np.asarray(pvals, dtype=float)
+    out = np.full(len(pvals), np.nan)
+    ok = np.where(~np.isnan(pvals))[0]
+    if len(ok) == 0: return out
+    order = ok[np.argsort(pvals[ok])]
+    m = len(order); running = 0
+    for rank, idx in enumerate(order):
+        adj = min((m-rank) * pvals[idx], 1.0)
+        running = max(running, adj)
+        out[idx] = running
+    return out
 
-    # Limpieza adicional ya validada
-    df.loc[(df['Height_cm'] < 3) & df['Height_cm'].notna(), 'Height_cm'] *= 100
-    df.loc[(df['Height_cm'] < 100) | (df['Height_cm'] > 220), 'Height_cm'] = np.nan
-    df.loc[(df['Weight_kg'] > 300) | (df['Weight_kg'] < 25), 'Weight_kg'] = np.nan
-    df['BMI'] = df['Weight_kg'] / (df['Height_cm']/100)**2
-    df.loc[(df['BMI']<10)|(df['BMI']>70), 'BMI'] = np.nan
-    for col in ['SBP_1st','SBP_2nd','DBP_1st','DBP_2nd']:
-        df.loc[(df[col]>250)|(df[col]<40), col] = np.nan
+def smart_categorical_test(df, group, outcome):
+    """Test global para outcome categórico/binario vs grupos.
+    Usa Fisher en 2x2 con frecuencias esperadas bajas; si no, Chi².
+    """
+    sub = df.dropna(subset=[group, outcome]).copy()
+    if len(sub) < 5 or sub[group].nunique() < 2 or sub[outcome].nunique() < 2:
+        return {'method':'No aplicable', 'p':np.nan, 'note':'datos insuficientes'}
+    tab = pd.crosstab(sub[group], sub[outcome])
+    try:
+        chi2, p_chi, _, expected = stats.chi2_contingency(tab)
+        low_exp = (expected < 5).sum()
+        low_prop = low_exp / expected.size
+        if tab.shape == (2,2) and low_exp > 0:
+            _, p = stats.fisher_exact(tab)
+            return {'method':'Fisher exacto 2×2', 'p':p, 'note':'usado por frecuencias esperadas <5'}
+        note = ''
+        if low_prop > 0.20:
+            note = 'precaución: >20% de celdas con frecuencia esperada <5'
+        return {'method':'Chi² de independencia', 'p':p_chi, 'note':note}
+    except Exception as e:
+        return {'method':'No calculable', 'p':np.nan, 'note':str(e)}
 
-    def weight_cat(bmi):
-        if pd.isna(bmi): return np.nan
-        if bmi < 18.5: return 'bajo peso'
-        elif bmi < 25: return 'peso normal'
-        elif bmi < 30: return 'sobrepeso'
-        else: return 'obeso'
-    df['Weight_Category_clean'] = df['BMI'].apply(weight_cat)
-    df['Obesity'] = (df['Weight_Category_clean']=='obeso').astype('Int64')
-    df.loc[df['Weight_Category_clean'].isna(), 'Obesity'] = pd.NA
+def pairwise_categorical_posthoc(df, group, outcome, min_n=5):
+    sub = df.dropna(subset=[group, outcome]).copy()
+    levels = [x for x in sub[group].dropna().unique()]
+    rows=[]
+    for i in range(len(levels)):
+        for j in range(i+1, len(levels)):
+            a,b = levels[i], levels[j]
+            tmp = sub[sub[group].isin([a,b])]
+            if tmp[group].value_counts().min() < min_n: continue
+            tab = pd.crosstab(tmp[group], tmp[outcome])
+            if tab.shape != (2,2): continue
+            try:
+                chi2, p_chi, _, exp = stats.chi2_contingency(tab)
+                method = 'Fisher' if (exp < 5).any() else 'Chi² 2×2'
+                p = stats.fisher_exact(tab)[1] if method == 'Fisher' else p_chi
+                pa = tmp.loc[tmp[group]==a, outcome].mean()*100
+                pb = tmp.loc[tmp[group]==b, outcome].mean()*100
+                rows.append({'Comparación':f'{a} vs {b}', 'Δ prevalencia pp':pa-pb,
+                             'p':p, 'Método':method})
+            except Exception:
+                pass
+    if not rows: return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out['p ajustado Holm'] = _holm_adjust(out['p'].values)
+    out['Significativo'] = out['p ajustado Holm'] < 0.05
+    return out.sort_values('p ajustado Holm')
 
-    # CKD definitions
-    df['CKD_eGFR_lt60'] = (df['eGFR_1st'] < 60).astype('Int64')
-    df.loc[df['eGFR_1st'].isna(), 'CKD_eGFR_lt60'] = pd.NA
-
-    def alb_cat(p):
-        if pd.isna(p): return np.nan
-        if p == 'Neg': return 'A1 (Neg)'
+def smart_continuous_test(df, group, value):
+    """Test global para variable continua según grupos: t/Mann-Whitney o ANOVA/Kruskal."""
+    sub = df.dropna(subset=[group, value]).copy()
+    groups = [g[value].astype(float).values for _, g in sub.groupby(group) if len(g) >= 3]
+    labels = [k for k, g in sub.groupby(group) if len(g) >= 3]
+    if len(groups) < 2:
+        return {'method':'No aplicable', 'p':np.nan, 'note':'datos insuficientes', 'posthoc':pd.DataFrame()}
+    normal = True
+    for arr in groups:
+        if len(arr) < 3:
+            normal = False; break
+        # Shapiro se limita a 5000 obs por restricción del test
+        sample = arr if len(arr) <= 5000 else np.random.default_rng(123).choice(arr, 5000, replace=False)
         try:
-            pv = float(p)
-            return 'A2 (30 mg/dL)' if pv <= 30 else 'A3 (≥100 mg/dL)'
-        except: return np.nan
-    df['Albuminuria_cat'] = df['Proteinuria'].apply(alb_cat)
-    df['Proteinuria_pos'] = df['Proteinuria'].apply(
-        lambda x: 0 if x=='Neg' else (1 if pd.notna(x) else pd.NA)
-    ).astype('Int64')
-    df['Hematuria_pos'] = df['Blood'].apply(
-        lambda x: 0 if x=='Neg' else (1 if pd.notna(x) else pd.NA)
-    ).astype('Int64')
+            if stats.shapiro(sample).pvalue < 0.05:
+                normal = False; break
+        except Exception:
+            normal = False; break
+    try:
+        lev_p = stats.levene(*groups, center='median').pvalue
+    except Exception:
+        lev_p = np.nan
+    equal_var = pd.notna(lev_p) and lev_p >= 0.05
+    if len(groups) == 2:
+        if normal:
+            res = stats.ttest_ind(groups[0], groups[1], equal_var=equal_var, nan_policy='omit')
+            method = 't de Student' if equal_var else 't de Welch'
+            note = 'normalidad compatible; varianzas homogéneas' if equal_var else 'normalidad compatible; varianzas desiguales'
+        else:
+            res = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+            method = 'Mann–Whitney U'
+            note = 'distribución no normal o asimétrica'
+        return {'method':method, 'p':res.pvalue, 'note':note, 'posthoc':pd.DataFrame()}
+    else:
+        if normal and equal_var:
+            res = stats.f_oneway(*groups)
+            method = 'ANOVA una vía'
+            note = 'normalidad y homocedasticidad compatibles'
+            pair_method = 't pareada independiente'
+        else:
+            res = stats.kruskal(*groups)
+            method = 'Kruskal–Wallis'
+            note = 'no normalidad y/o varianzas heterogéneas'
+            pair_method = 'Mann–Whitney'
+        rows=[]
+        for i in range(len(groups)):
+            for j in range(i+1,len(groups)):
+                if pair_method.startswith('t'):
+                    p = stats.ttest_ind(groups[i], groups[j], equal_var=False, nan_policy='omit').pvalue
+                else:
+                    p = stats.mannwhitneyu(groups[i], groups[j], alternative='two-sided').pvalue
+                rows.append({'Comparación':f'{labels[i]} vs {labels[j]}', 'p':p, 'Método':pair_method})
+        ph = pd.DataFrame(rows)
+        if len(ph):
+            ph['p ajustado Holm'] = _holm_adjust(ph['p'].values)
+            ph['Significativo'] = ph['p ajustado Holm'] < 0.05
+            ph = ph.sort_values('p ajustado Holm')
+        return {'method':method, 'p':res.pvalue, 'note':note, 'posthoc':ph}
 
-    df['CKD_extended'] = ((df['eGFR_1st']<60) | (df['Proteinuria_pos']==1)).astype('Int64')
-    df.loc[df['eGFR_1st'].isna() & df['Proteinuria_pos'].isna(), 'CKD_extended'] = pd.NA
+def style_sig(df, pcols=('p','p ajustado Holm')):
+    """Resalta en pastel filas/celdas significativas en tablas Streamlit."""
+    pcols = [c for c in pcols if c in df.columns]
+    if not pcols: return df
+    def row_style(row):
+        sig = False
+        for c in pcols:
+            try:
+                if pd.notna(row[c]) and float(row[c]) < 0.05:
+                    sig = True
+            except Exception:
+                pass
+        return ['background-color: #EAF6EA' if sig else '' for _ in row]
+    return df.style.apply(row_style, axis=1)
 
-    df['HTA_measured'] = df['BP_Final'].isin(
-        ['Stage 1 HTN','Stage 2 HTN','Hypertensive Crisis']
-    ).astype('Int64')
-    df.loc[df['BP_Final'].isin(['Missing data', np.nan]), 'HTA_measured'] = pd.NA
 
-    df['Glucose_high'] = (df['Glucose_1st']>=200).astype('Int64')
-    df.loc[df['Glucose_1st'].isna(), 'Glucose_high'] = pd.NA
+def humanize_varname(c):
+    """Etiqueta legible para variables binarias estandarizadas."""
+    txt = str(c)
+    replacements = {
+        'OtraCondicion_': 'Otra condición: ',
+        'AF_': 'Antecedente familiar: ',
+        'Dg_': 'Diagnóstico: ',
+        'AINEs_': 'AINEs: ',
+        'Eval_': 'Evaluación: ',
+        'Accion_': 'Acción: ',
+        'Acción_': 'Acción: ',
+        'Pesquisa_': 'Pesquisa: ',
+    }
+    for k, v in replacements.items():
+        txt = txt.replace(k, v)
+    txt = txt.replace('_', ' ').replace('  ', ' ').strip()
+    return txt
 
-    # KDIGO risk
-    def kdigo_risk(g, a):
-        risk_map = {
-            ('G1','A1'):'Bajo',('G1','A2'):'Moderado',('G1','A3'):'Alto',
-            ('G2','A1'):'Bajo',('G2','A2'):'Moderado',('G2','A3'):'Alto',
-            ('G3a','A1'):'Moderado',('G3a','A2'):'Alto',('G3a','A3'):'Muy alto',
-            ('G3b','A1'):'Alto',('G3b','A2'):'Muy alto',('G3b','A3'):'Muy alto',
-            ('G4','A1'):'Muy alto',('G4','A2'):'Muy alto',('G4','A3'):'Muy alto',
-            ('G5','A1'):'Muy alto',('G5','A2'):'Muy alto',('G5','A3'):'Muy alto',
+def is_binary_series(s):
+    vals = pd.Series(s).dropna().unique()
+    if len(vals) == 0:
+        return False
+    try:
+        return set(pd.Series(vals).astype(float).unique()).issubset({0.0, 1.0})
+    except Exception:
+        return False
+
+
+def _norm_varname_for_filter(c):
+    """Normaliza nombres de variables para filtros semánticos robustos."""
+    t = norm_key(c)
+    if pd.isna(t):
+        return ''
+    return str(t).replace('_', ' ').replace('-', ' ')
+
+
+def is_nonanalytic_indicator_name(c):
+    """Identifica columnas auxiliares que no deben entrar en análisis de riesgo."""
+    t = _norm_varname_for_filter(c)
+    excluded_terms = [
+        'revisar', 'revision', 'dato faltante', 'sin informacion',
+        'sin alteraciones relevantes', 'antecedente no especificado',
+        'sin antecedentes declarados', 'no especificado', 'diagnostico provisional obs',
+    ]
+    return any(term in t for term in excluded_terms)
+
+
+def combine_binary_any(df, cols):
+    """Combina variables 0/1 equivalentes: 1 si cualquiera es 1; 0 si hay algún 0 y ningún 1; NaN si todo falta."""
+    avail = [c for c in cols if c in df.columns]
+    if not avail:
+        return pd.Series(np.nan, index=df.index, dtype='float')
+    mat = pd.concat([pd.to_numeric(df[c], errors='coerce') for c in avail], axis=1)
+    any_pos = (mat == 1).any(axis=1)
+    any_zero = (mat == 0).any(axis=1)
+    return pd.Series(np.where(any_pos, 1.0, np.where(any_zero, 0.0, np.nan)), index=df.index)
+
+
+def standardized_binary_columns(df):
+    """Columnas estandarizadas 01-05 con codificación 0/1 usable en RR/estratificación."""
+    prefixes = ('OtraCondicion_', 'AF_', 'Dg_', 'AINEs_', 'Eval_', 'Accion_', 'Acción_', 'Pesquisa_')
+    cols = []
+    for c in df.columns:
+        if is_nonanalytic_indicator_name(c):
+            continue
+        if c.startswith(prefixes) and is_binary_series(df[c]):
+            # Excluir indicadores redundantes o poco interpretables si aparecen vacíos.
+            if df[c].notna().sum() >= 10 and pd.to_numeric(df[c], errors='coerce').sum(skipna=True) >= 5:
+                cols.append(c)
+    return cols
+
+def rr_rows_for_binary_vars(df, variables, outcome='CKD60', min_exposed=5, min_unexposed=5):
+    rows=[]
+    for var, lbl in variables:
+        if var not in df.columns:
+            continue
+        sub=df.dropna(subset=[var,outcome]).copy()
+        if len(sub)<10:
+            continue
+        try:
+            sub[var]=pd.to_numeric(sub[var], errors='coerce')
+        except Exception:
+            continue
+        sub=sub.dropna(subset=[var,outcome])
+        ex=sub[sub[var]==1]; nx=sub[sub[var]==0]
+        if len(ex)<min_exposed or len(nx)<min_unexposed:
+            continue
+        eck=int((ex[outcome]==1).sum()); nck=int((nx[outcome]==1).sum())
+        if eck==0 or nck==0:
+            continue
+        rr=(eck/len(ex))/(nck/len(nx))
+        se=np.sqrt(1/eck-1/len(ex)+1/nck-1/len(nx))
+        lo=np.exp(np.log(rr)-1.96*se); hi=np.exp(np.log(rr)+1.96*se)
+        test = smart_categorical_test(sub,var,outcome)
+        rows.append({'Factor':lbl,'Variable':var,'N expuestos':len(ex), 'N no expuestos':len(nx),
+                     'n ERC expuestos':eck, 'n ERC no exp.':nck,
+                     '%ERC expuestos':eck/len(ex)*100,'%ERC no exp.':nck/len(nx)*100,
+                     'RR':rr,'IC inf':lo,'IC sup':hi,'p':test.get('p',np.nan),'Test':test.get('method','')})
+    return pd.DataFrame(rows)
+
+
+def standardized_risk_columns(df, include_groups=('antecedentes','familiares','aines')):
+    """Columnas 0/1 estandarizadas útiles como exposiciones basales/exploratorias.
+
+    Se excluyen por diseño variables de evaluación, acciones o pesquisa clínica posterior
+    porque no representan exposiciones basales para interpretar como riesgo.
+    """
+    prefix_map = {
+        'antecedentes': ('OtraCondicion_', 'Dg_'),
+        'familiares': ('AF_',),
+        'aines': ('AINEs_',),
+    }
+    prefixes = tuple(p for g in include_groups for p in prefix_map.get(g, ()))
+    cols = []
+    # Duplicados/no exposición que no conviene presentar como factores de riesgo.
+    # AINEs_diario se deriva de la base principal; si existe Planilla 03 se usa AINEs_Uso_Diario.
+    aines_exclude = {'AINEs_diario', 'AINEs_diario_modelo', 'AINEs_NoUso_Reportado'}
+    for c in df.columns:
+        if is_nonanalytic_indicator_name(c):
+            continue
+        if c in aines_exclude:
+            continue
+        if c.startswith(prefixes) and is_binary_series(df[c]):
+            if df[c].notna().sum() >= 10 and pd.to_numeric(df[c], errors='coerce').sum(skipna=True) >= 5:
+                cols.append(c)
+    return cols
+
+
+def prevalence_ratio_row(df, var, lbl, outcome='CKD60', covariates=None,
+                         min_exposed=5, min_unexposed=5, min_events=1):
+    """Calcula RP/RR cruda o ajustada para una exposición binaria.
+
+    - Crudo: razón de prevalencias directa con IC log aproximado.
+    - Ajustado: GLM Poisson con enlace log y varianza robusta HC3.
+    """
+    if var not in df.columns or outcome not in df.columns:
+        return None
+    covariates = [c for c in (covariates or []) if c in df.columns and c != var]
+    need = [var, outcome] + covariates
+    sub = df[need].copy()
+    for c in need:
+        sub[c] = pd.to_numeric(sub[c], errors='coerce')
+    sub = sub.dropna(subset=need)
+    if len(sub) < 10:
+        return None
+    sub = sub[sub[var].isin([0,1]) & sub[outcome].isin([0,1])]
+    if len(sub) < 10:
+        return None
+    ex = sub[sub[var] == 1]
+    nx = sub[sub[var] == 0]
+    if len(ex) < min_exposed or len(nx) < min_unexposed:
+        return None
+    eck = int((ex[outcome] == 1).sum())
+    nck = int((nx[outcome] == 1).sum())
+    if eck < min_events or nck < min_events:
+        return None
+
+    base = {
+        'Factor': lbl, 'Variable': var,
+        'N modelo': len(sub), 'N expuestos': len(ex), 'N no expuestos': len(nx),
+        'n ERC expuestos': eck, 'n ERC no exp.': nck,
+        '%ERC expuestos': eck/len(ex)*100, '%ERC no exp.': nck/len(nx)*100,
+    }
+
+    if not covariates:
+        rr = (eck/len(ex))/(nck/len(nx))
+        se = np.sqrt(1/eck - 1/len(ex) + 1/nck - 1/len(nx))
+        lo = np.exp(np.log(rr) - 1.96*se)
+        hi = np.exp(np.log(rr) + 1.96*se)
+        test = smart_categorical_test(sub, var, outcome)
+        base.update({'RP': rr, 'IC inf': lo, 'IC sup': hi, 'p': test.get('p', np.nan),
+                     'Método': 'Crudo', 'Ajuste': 'Sin ajuste', 'Test': test.get('method', '')})
+        return base
+
+    try:
+        y = sub[outcome].astype(float)
+        X = sub[[var] + covariates].astype(float).rename(columns={var: 'EXPOSURE'})
+        X = sm.add_constant(X, has_constant='add')
+        mod = sm.GLM(y, X, family=sm.families.Poisson()).fit(cov_type='HC3')
+        beta = mod.params['EXPOSURE']
+        se = mod.bse['EXPOSURE']
+        base.update({'RP': float(np.exp(beta)),
+                     'IC inf': float(np.exp(beta - 1.96*se)),
+                     'IC sup': float(np.exp(beta + 1.96*se)),
+                     'p': float(mod.pvalues['EXPOSURE']),
+                     'Método': 'Poisson robusto',
+                     'Ajuste': ', '.join(covariates),
+                     'Test': 'GLM Poisson robusto'})
+        return base
+    except Exception as e:
+        base.update({'RP': np.nan, 'IC inf': np.nan, 'IC sup': np.nan, 'p': np.nan,
+                     'Método': 'No calculable', 'Ajuste': ', '.join(covariates), 'Test': str(e)})
+        return base
+
+
+def prevalence_ratio_table(df, variables, outcome='CKD60', covariates=None):
+    rows = []
+    for var, lbl in variables:
+        r = prevalence_ratio_row(df, var, lbl, outcome=outcome, covariates=covariates)
+        if r is not None:
+            rows.append(r)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.dropna(subset=['RP'])
+    return out
+
+
+def add_rural_binary(df):
+    if 'Rural_bin' not in df.columns and 'Rural_lbl' in df.columns:
+        df['Rural_bin'] = np.where(df['Rural_lbl'].eq('Rural (≥30%)'), 1.0,
+                                   np.where(df['Rural_lbl'].eq('Urbano (<30%)'), 0.0, np.nan))
+    return df
+
+
+def plot_pr_forest(pr_df, title_x='Razón de prevalencias (escala log)'):
+    fig = go.Figure()
+    if pr_df is None or len(pr_df) == 0:
+        return fig
+    plot_df = pr_df.sort_values('RP').copy()
+    for _, r in plot_df.iterrows():
+        col = (C_ACC if r['IC inf'] > 1 else C_OK if r['IC sup'] < 1 else C_GRAY)
+        fig.add_trace(go.Scatter(x=[r['IC inf'], r['IC sup']], y=[r['Factor'], r['Factor']],
+                                 mode='lines', line=dict(color=col, width=2),
+                                 showlegend=False, hoverinfo='skip'))
+        fig.add_trace(go.Scatter(x=[r['RP']], y=[r['Factor']], mode='markers',
+                                 marker=dict(color=col, size=12, line=dict(color='white', width=1.5)),
+                                 showlegend=False,
+                                 hovertemplate=(f"<b>{r['Factor']}</b><br>RP={r['RP']:.2f} "
+                                                f"({r['IC inf']:.2f}–{r['IC sup']:.2f})"
+                                                f"<br>p={r['p']:.4f}<br>N modelo={int(r['N modelo'])}"
+                                                f"<extra></extra>")))
+    fig.add_vline(x=1, line_dash='dash', line_color='gray')
+    fig.update_layout(xaxis=dict(title=title_x, type='log'),
+                      height=max(460, 28*len(plot_df)),
+                      margin=dict(l=10, r=10, t=20, b=20))
+    return fig
+
+# compatibilidad con código antiguo: ahora delega en la selección automática categórica
+def chi2p(df, var, out):
+    return smart_categorical_test(df, var, out).get('p', np.nan)
+
+def bar_annotations(x_vals, y_vals, hi_vals, labels, is_horizontal=False, font_size=11):
+    """Return a list of Plotly annotations placed above the upper error bar whisker."""
+    anns = []
+    for x, y, hi, lbl in zip(x_vals, y_vals, hi_vals, labels):
+        if pd.isna(y) or pd.isna(hi): continue
+        offset = max(hi * 0.06, 1.0)
+        if is_horizontal:
+            anns.append(dict(x=hi+offset, y=x, text=lbl, showarrow=False,
+                xanchor='left', yanchor='middle',
+                font=dict(size=font_size, color='#333')))
+        else:
+            anns.append(dict(x=x, y=hi+offset, text=lbl, showarrow=False,
+                xanchor='center', yanchor='bottom',
+                font=dict(size=font_size, color='#333')))
+    return anns
+
+def yn(s):
+    if pd.isna(s): return np.nan
+    t = str(s).strip().lower()
+    if t in ('sí','si','yes','1','1.0','true'): return 1
+    if t in ('no','0','0.0','false'): return 0
+    return np.nan
+
+def kdigo_g(e):
+    if pd.isna(e): return np.nan
+    if e >= 90: return 'G1'
+    if e >= 60: return 'G2'
+    if e >= 45: return 'G3a'
+    if e >= 30: return 'G3b'
+    if e >= 15: return 'G4'
+    return 'G5'
+
+def kdigo_risk(g, a):
+    m = {
+        ('G1','A1'):'Bajo',('G1','A2'):'Moderado',('G1','A3'):'Alto',
+        ('G2','A1'):'Bajo',('G2','A2'):'Moderado',('G2','A3'):'Alto',
+        ('G3a','A1'):'Moderado',('G3a','A2'):'Alto',('G3a','A3'):'Muy alto',
+        ('G3b','A1'):'Alto',('G3b','A2'):'Muy alto',('G3b','A3'):'Muy alto',
+        ('G4','A1'):'Muy alto',('G4','A2'):'Muy alto',('G4','A3'):'Muy alto',
+        ('G5','A1'):'Muy alto',('G5','A2'):'Muy alto',('G5','A3'):'Muy alto',
+    }
+    if pd.isna(g) or pd.isna(a): return np.nan
+    return m.get((g, a), np.nan)
+
+def alb_cat(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip().lower()
+    if s in ('neg','negative','negativo','0'): return 'A1'
+    try:
+        f = float(s); return 'A2' if f <= 30 else 'A3'
+    except: return np.nan
+
+# ═══════════════════════════════════════════════════════════
+# CARGA DE DATOS
+# ═══════════════════════════════════════════════════════════
+@st.cache_data(show_spinner="Cargando y preparando datos…")
+def load_data(main_path, p01=None, p02=None, p03=None, p04=None, p05=None):
+    df = pd.read_excel(main_path, sheet_name='Datos_analisis_curadomanual')
+
+    # Excluir creatinina > 10
+    df = df[df['Creatinine_1st'] <= 10].copy()
+
+    # ── eGFR principal = CKD-EPI 2021 ──
+    df['eGFR'] = df['eGFR_1st_CKD_EPI_2021_calc']
+    df['eGFR_orig'] = df['eGFR_1st']
+
+    # ── Sexo (texto en v3) ──
+    df['Sex_lbl'] = df['Sex'].astype(str).str.strip()
+    df['Sex_M']   = (df['Sex_lbl'] == 'Hombre').astype(int)
+
+    # ── eGFR comparativo = MDRD-4 clásico usado por Zúñiga 2011 ──
+    # Fórmula reportada: 186 × creatinina^-1.154 × edad^-0.203 × 0.742 si mujer
+    # Se mantiene solo como variable auxiliar para comparación en Literatura,
+    # sin modificar la definición principal CKD-EPI 2021 del dashboard.
+    df['eGFR_MDRD4_Zuniga'] = np.where(
+        df['Creatinine_1st'].notna() & df['Age'].notna() & (df['Creatinine_1st'] > 0) & (df['Age'] > 0),
+        186 * (df['Creatinine_1st'] ** -1.154) * (df['Age'] ** -0.203)
+        * np.where(df['Sex_lbl'].eq('Mujer'), 0.742, 1.0),
+        np.nan
+    )
+
+
+    # ── PPOO ──
+    df['PPOO_n']   = df['¿PPOO?'].apply(yn)
+    df['PPOO_lbl'] = df['PPOO_n'].map({1: 'PPOO', 0: 'No PPOO'})
+
+    # ── Edad ──
+    df['Age_grp'] = pd.cut(df['Age'], [-1,29.999,44.999,59.999,74.999,200],
+                           labels=['<30','30-44','45-59','60-74','≥75'])
+
+    # ── Autoreportes (Sí/No/texto) ──
+    for src, dst in [
+        ('LE HAN DICHO QUE TIENE HTA','HTA_sr'),
+        ('LE HAN DICHO QUE TIENE DM?','DM_sr'),
+        ('HISTORIA PERSONAL LITIASIS','Litiasis'),
+        ('ITU RECURRENTE','ITU'),
+        ('ANTEC. FAMILIAR ERC','FamHx'),
+        ('TTO_ERC','TTO_ERC_b'),
+        ('TABACO','Tabaco'),
+        ('OH','OH_b'),
+        ('Glucose_gt200','Glc200'),
+    ]:
+        if src in df.columns:
+            df[dst] = df[src].apply(yn)
+
+    # ── PA ──
+    df['HTA_meas'] = df['BP_Final'].isin(
+        ['Stage 1 HTN','Stage 2 HTN','Hypertensive Crisis']).astype(float)
+    df.loc[df['BP_Final'].isin(['left blank']) | df['BP_Final'].isna(), 'HTA_meas'] = np.nan
+
+    # ── Proteinuria / hematuria ──
+    def dippos(v):
+        if pd.isna(v): return np.nan
+        s = str(v).strip().lower()
+        if s in ('neg','negative','negativo','0'): return 0
+        try: return 1 if float(s) > 0 else 0
+        except: return 1 if s not in ('','nan') else np.nan
+    df['prot_pos']  = df['Proteinuria'].apply(dippos)
+    df['blood_pos'] = df['Blood'].apply(dippos)
+    df['Alb_cat']   = df['Proteinuria'].apply(alb_cat)
+
+    # ── KDIGO ──
+    df['KDIGO_G']    = df['eGFR'].apply(kdigo_g)
+    df['KDIGO_risk'] = df.apply(lambda r: kdigo_risk(r['KDIGO_G'], r['Alb_cat']), axis=1)
+
+    # ── ERC definiciones ──
+    df['CKD60'] = np.where(df['eGFR'].notna(), (df['eGFR'] < 60).astype(float), np.nan)
+    df['CKD_exp'] = np.where(
+        df['eGFR'].notna() | df['prot_pos'].notna(),
+        ((df['eGFR'] < 60) | (df['prot_pos'] == 1)).astype(float), np.nan)
+
+    # ── BMI (usa BMI_Category si existe) ──
+    if 'BMI_Category' in df.columns:
+        df['BMI_cat'] = df['BMI_Category'].astype(str).str.strip()
+        df['Obesity']  = df['BMI_cat'].str.contains('Obesidad', na=False).astype(float)
+        df.loc[df['BMI_Category'].isna(), 'Obesity'] = np.nan
+    else:
+        df['BMI_cat'] = np.nan; df['Obesity'] = np.nan
+
+    # ── AINEs ──
+    if 'Consumo AINEs' in df.columns:
+        aines_map = {
+            'Nunca': 0, 'Never': 0,
+            'Cuando sea necesario': 1,
+            'Unas pocas al mes': 2,
+            '1-4 al día': 3, '5-10 al día': 4,
         }
-        if pd.isna(g) or pd.isna(a): return np.nan
-        return risk_map.get((g, a.split(' ')[0]), np.nan)
-    df['KDIGO_risk'] = df.apply(lambda r: kdigo_risk(r['CKD_KDIGO_G'], r['Albuminuria_cat']), axis=1)
+        df['AINEs_ord'] = df['Consumo AINEs'].map(aines_map)
+        df['AINEs_diario'] = (df['AINEs_ord'] >= 3).astype(float)
+        df.loc[df['AINEs_ord'].isna(), 'AINEs_diario'] = np.nan
+    else:
+        df['AINEs_ord'] = np.nan; df['AINEs_diario'] = np.nan
+
+    # ── Comunas y ruralidad ──
+    df['Community_key'] = df['Community'].apply(norm_key)
+    df['Community_std'] = df['Community_key'].map(COMUNA_CANONICA_NORM)
+    # Si aparece una comuna no incluida en el diccionario, se conserva como nombre propio aproximado.
+    df['Community_std'] = df['Community_std'].fillna(
+        df['Community'].astype(str).str.strip().str.title().replace({'Nan': np.nan})
+    )
+    df['Ruralidad_pct'] = df['Community_key'].map(RURALIDAD_NORM)
+    df['Rural_lbl']     = df['Ruralidad_pct'].apply(
+        lambda x: 'Rural (≥30%)' if pd.notna(x) and x >= 30 else
+                  ('Urbano (<30%)' if pd.notna(x) else np.nan))
+
+    # ── Merge planillas de texto libre ──
+    # Planilla 01 — OtraCondicion
+    if p01 is not None:
+        try:
+            d01 = pd.read_excel(p01, sheet_name='Planilla_estandarizada')
+            c01 = ['ID'] + [c for c in d01.columns if c.startswith('OtraCondicion_')]
+            df = df.merge(d01[c01], on='ID', how='left')
+        except: pass
+
+    # Planilla 02 — Antecedentes familiares
+    if p02 is not None:
+        try:
+            d02 = pd.read_excel(p02, sheet_name='Estandarizado_AF')
+            c02 = ['ID'] + [c for c in d02.columns if c.startswith('AF_')]
+            d02a = d02.groupby('ID')[c02[1:]].max().reset_index()
+            df = df.merge(d02a, on='ID', how='left')
+        except: pass
+
+    # Planilla 03 — AINEs
+    if p03 is not None:
+        try:
+            d03 = pd.read_excel(p03, sheet_name='AINEs_estandarizado')
+            c03 = ['ID','AINEs_Categoria_Modelo','AINEs_Ordinal_Exposicion',
+                   'AINEs_UsoCualquierFrecuencia','AINEs_NoUso_Reportado',
+                   'AINEs_Uso_PRN_NoCuantificado','AINEs_Uso_OcasionalMensual',
+                   'AINEs_Uso_Diario','AINEs_Uso_Diario_Alto_5a10']
+            df = df.merge(d03[[c for c in c03 if c in d03.columns]], on='ID', how='left')
+        except: pass
+
+    # Planilla 04 — Diagnósticos
+    if p04 is not None:
+        try:
+            d04 = pd.read_excel(p04, sheet_name='Variables_modelo')
+            c04 = ['ID'] + [c for c in d04.columns if c.startswith('Dg_')]
+            df = df.merge(d04[c04], on='ID', how='left')
+        except: pass
+
+    # Planilla 05 — Evaluaciones/Acciones
+    if p05 is not None:
+        try:
+            d05 = pd.read_excel(p05, sheet_name='Para_modelo')
+            df = df.merge(d05, on='ID', how='left')
+        except: pass
+
+    # ── Variables canónicas / compuestas para evitar duplicados entre fuentes ──
+    # AINEs: si se carga la Planilla 03, se usa su codificación estandarizada;
+    # si no está disponible, se mantiene la variable derivada desde la base principal como respaldo.
+    if 'AINEs_Uso_Diario' in df.columns:
+        df['AINEs_diario_modelo'] = combine_binary_any(df, ['AINEs_Uso_Diario'])
+    else:
+        df['AINEs_diario_modelo'] = df.get('AINEs_diario', pd.Series(np.nan, index=df.index))
+
+    # Condiciones potencialmente equivalentes reportadas en distintas fuentes.
+    # Se combinan para el bloque de factores clínicos predefinidos.
+    df['Tiroides_global'] = combine_binary_any(df, ['Dg_Tiroides', 'OtraCondicion_Tiroides'])
+    df['DLP_global'] = combine_binary_any(df, ['Dg_DLP_Hipertrigliceridemia', 'OtraCondicion_DLP'])
+    df['Cardio_global'] = combine_binary_any(df, ['Dg_Cardiovascular_Global', 'OtraCondicion_Cardiovascular'])
+    df['Litiasis_global'] = combine_binary_any(df, ['Litiasis', 'Dg_LitiasisRenal_Nefrocalcinosis'])
+    df['ITU_global'] = combine_binary_any(df, ['ITU', 'Dg_ITU_Pielonefritis'])
+    df['Tabaco_global'] = combine_binary_any(df, ['Tabaco', 'Dg_Tabaquismo'])
+    df['OH_global'] = combine_binary_any(df, ['OH_b', 'Dg_Alcohol_Problema'])
+
+    # FamHx combinado (formulario + planilla 02)
+    fam_form = df.get('FamHx', pd.Series(np.nan, index=df.index))
+    fam_erc  = df.get('AF_ERC_IRC', pd.Series(np.nan, index=df.index))
+    fam_hd   = df.get('AF_Hemodialisis_Dialisis', pd.Series(np.nan, index=df.index))
+    df['FamHx_ERC'] = np.where(
+        (fam_form == 1) | (fam_erc == 1) | (fam_hd == 1), 1.0,
+        np.where((fam_form == 0) & ((fam_erc == 0) | fam_erc.isna()) &
+                 ((fam_hd == 0) | fam_hd.isna()), 0.0, np.nan))
+
+    # Monorreno / asimetría renal: diagnóstico estructurado + texto estandarizado si lo menciona explícitamente.
+    df['Monorreno'] = combine_binary_any(df, ['Dg_Monorreno_AsimetriaRenal'])
+    if 'CUÁL OTRA CONDICION PERSONAL (Estandarizado)' in df.columns:
+        df['Monorreno'] = np.where(
+            df['CUÁL OTRA CONDICION PERSONAL (Estandarizado)'].str.contains(
+                'monorreno|riñón único', case=False, na=False), 1.0, df['Monorreno'])
+
+    # Cardiopatía, tiroides y DLP consolidadas desde diagnóstico + otra condición personal.
+    df['Cardio']    = df['Cardio_global']
+    df['Tiroides']  = df['Tiroides_global']
+    df['DLP_dg']    = df['DLP_global']
+
+    # ERC oculta
+    df['ERC_oculta'] = np.where(
+        (df['CKD60'] == 1) & df['Creatinine_1st'].notna(),
+        (df['Creatinine_1st'] <= 1.0).astype(float), np.nan)
+
+    # Score clínico (4 variables — Informe 2 / v4)
+    def age_pts(a):
+        if pd.isna(a): return np.nan
+        if a < 45: return 0
+        if a < 60: return 1
+        if a < 75: return 2
+        return 4
+    df['sc_age']  = df['Age'].apply(age_pts)
+    df['sc_prot'] = np.where(df['prot_pos'] == 1, 2, 0)
+    df['sc_ob']   = np.where(df['Obesity'] == 1, 1, 0)
+    df['sc_fam']  = np.where(df['FamHx_ERC'] == 1, 1, 0)
+    df['SCORE']   = df['sc_age'] + df['sc_prot'] + df['sc_ob'] + df['sc_fam']
+    df.loc[df['sc_age'].isna(), 'SCORE'] = np.nan
 
     return df
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPERS ESTADÍSTICOS
+# SIDEBAR — carga y filtros
 # ═══════════════════════════════════════════════════════════
-def prev_ci_wilson(s, t):
-    if t == 0:
-        return (np.nan, np.nan, np.nan)
-    p = s/t
-    z = 1.96
-    den = 1 + z**2/t
-    centre = p + z**2/(2*t)
-    margin = z*np.sqrt(p*(1-p)/t + z**2/(4*t**2))
-    return (p*100, (centre-margin)/den*100, (centre+margin)/den*100)
+st.sidebar.title("🩺 ERC Araucanía v4")
+st.sidebar.caption("CKD-EPI 2021 | Planillas 01-05 | Ruralidad comunal")
 
+with st.sidebar.expander("📁 Archivos de datos", expanded=False):
+    main_f = st.file_uploader("Base principal: ckd_data_v3_3.xlsx", type=['xlsx'], key='main')
+    p01_f  = st.file_uploader("01_otra_condicion_salud.xlsx", type=['xlsx'], key='p01')
+    p02_f  = st.file_uploader("02_antecedentes_familiares.xlsx", type=['xlsx'], key='p02')
+    p03_f  = st.file_uploader("03_consumo_aines.xlsx", type=['xlsx'], key='p03')
+    p04_f  = st.file_uploader("04_otros_diagnosticos.xlsx", type=['xlsx'], key='p04')
+    p05_f  = st.file_uploader("05_evaluacion_medica.xlsx", type=['xlsx'], key='p05')
 
-def chi2_pvalue(df, var, outcome):
-    sub = df.dropna(subset=[var, outcome])
-    if len(sub) == 0 or sub[var].nunique() < 2:
-        return np.nan
-    try:
-        tab = pd.crosstab(sub[var], sub[outcome])
-        return stats.chi2_contingency(tab)[1]
-    except Exception:
-        return np.nan
+@st.cache_data
+def _load(mf, p1, p2, p3, p4, p5):
+    return load_data(mf, p1, p2, p3, p4, p5)
 
-
-# ═══════════════════════════════════════════════════════════
-# SIDEBAR — Filtros
-# ═══════════════════════════════════════════════════════════
-st.sidebar.title("🩺 Filtros del análisis")
-st.sidebar.caption("Aplican a todas las pestañas")
-
-# Carga
-uploaded = st.sidebar.file_uploader(
-    "Archivo de datos (.xlsx)",
-    type=['xlsx'],
-    help="Si no subes archivo, se buscará CKD_DATA_v2.xlsx en el directorio actual"
-)
-
-if uploaded is not None:
-    df_raw = load_data(uploaded)
+if main_f is not None:
+    df_raw = _load(main_f, p01_f, p02_f, p03_f, p04_f, p05_f)
 else:
+    def _first_existing(patterns):
+        for pat in patterns:
+            hits = sorted(Path('.').glob(pat))
+            if hits:
+                return str(hits[0])
+        return None
+
+    # Carga automática desde la carpeta de ejecución. Si existen las planillas 01-05
+    # junto a la app, también se fusionan automáticamente; si no, se pueden subir
+    # desde el sidebar.
+    main_auto = _first_existing(['ckd_data_v3_3.xlsx', 'CKD_DATA_v3_3.xlsx', 'CKD_DATA_v3.3.xlsx'])
+    p01_auto = _first_existing(['01_otra_condicion_salud.xlsx', '01*condici*n*salud*.xlsx', '01*Condici*n*Salud*.xlsx', '01*.xlsx'])
+    p02_auto = _first_existing(['02_antecedentes_familiares.xlsx', '02*Antec*.xlsx', '02*Fliares*.xlsx', '02*.xlsx'])
+    p03_auto = _first_existing(['03_consumo_aines.xlsx', '03*AINE*.xlsx', '03*aine*.xlsx', '03*.xlsx'])
+    p04_auto = _first_existing(['04_otros_diagnosticos.xlsx', '04*diagnost*.xlsx', '04*Diagnost*.xlsx', '04*.xlsx'])
+    p05_auto = _first_existing(['05_evaluacion_medica.xlsx', '05*evaluacion*.xlsx', '05*Evaluacion*.xlsx', '05*.xlsx'])
+
+    if main_auto is None:
+        st.error(
+            "No se encontró la base principal. Sube el archivo desde el sidebar.\n\n"
+            "Nombres buscados: ckd_data_v3_3.xlsx, CKD_DATA_v3_3.xlsx o CKD_DATA_v3.3.xlsx."
+        )
+        st.stop()
     try:
-        df_raw = load_data('CKD_DATA_v2.xlsx')
+        df_raw = load_data(main_auto, p01_auto, p02_auto, p03_auto, p04_auto, p05_auto)
+        with st.sidebar.expander("Carga automática detectada", expanded=False):
+            st.write(f"Base principal: {main_auto}")
+            st.write(f"Planilla 01: {p01_auto or 'no detectada'}")
+            st.write(f"Planilla 02: {p02_auto or 'no detectada'}")
+            st.write(f"Planilla 03: {p03_auto or 'no detectada'}")
+            st.write(f"Planilla 04: {p04_auto or 'no detectada'}")
+            st.write(f"Planilla 05: {p05_auto or 'no detectada'}")
     except Exception as e:
-        st.error(f"No se encontró CKD_DATA_v2.xlsx en este directorio y no se subió archivo.\n\nError: {e}")
+        st.error(f"No se pudo cargar la base/planillas detectadas. Sube los archivos desde el sidebar.\n\n{e}")
         st.stop()
 
-# Filtros
+# ── Filtros ──────────────────────────────────────────────
 st.sidebar.markdown("### Filtros")
 
 age_min, age_max = st.sidebar.slider(
     "Rango de edad (años)",
-    int(df_raw['Age'].min()) if df_raw['Age'].notna().any() else 18,
-    int(df_raw['Age'].max()) if df_raw['Age'].notna().any() else 100,
-    (int(df_raw['Age'].min()) if df_raw['Age'].notna().any() else 18,
-     int(df_raw['Age'].max()) if df_raw['Age'].notna().any() else 100),
-)
+    int(df_raw['Age'].min(skipna=True)), int(df_raw['Age'].max(skipna=True)),
+    (int(df_raw['Age'].min(skipna=True)), int(df_raw['Age'].max(skipna=True))))
 
-# Comunas con n≥10
-comm_counts = df_raw['Community'].value_counts()
+comm_counts = df_raw['Community_std'].value_counts()
 all_comms = sorted(comm_counts[comm_counts >= 5].index.tolist())
-selected_comms = st.sidebar.multiselect(
-    "Comunas (solo con n ≥ 5)",
-    options=all_comms,
-    default=all_comms,
-    help="Por defecto todas. Quita las que no quieras incluir."
-)
+sel_comms = st.sidebar.multiselect("Comunas (n≥5)", all_comms, default=all_comms)
 
-ppoo_filter = st.sidebar.multiselect(
-    "Pueblo originario",
-    options=['PPOO', 'No PPOO'],
-    default=['PPOO', 'No PPOO'],
-)
+ppoo_f = st.sidebar.multiselect("Pueblo originario",
+    ['PPOO','No PPOO'], default=['PPOO','No PPOO'])
+sex_f  = st.sidebar.multiselect("Sexo",
+    ['Mujer','Hombre'], default=['Mujer','Hombre'])
+rural_f = st.sidebar.multiselect("Ruralidad",
+    ['Rural (≥30%)','Urbano (<30%)'], default=['Rural (≥30%)','Urbano (<30%)'])
 
-sex_filter = st.sidebar.multiselect(
-    "Sexo",
-    options=['Mujer', 'Hombre'],
-    default=['Mujer', 'Hombre'],
-)
-
-st.sidebar.markdown("### Filtros opcionales")
-
-bmi_filter = st.sidebar.multiselect(
-    "Estado nutricional (IMC)",
-    options=['bajo peso','peso normal','sobrepeso','obeso'],
-    default=['bajo peso','peso normal','sobrepeso','obeso'],
-)
-
-hta_filter = st.sidebar.radio(
-    "HTA autoreportada",
-    options=['Todos','Solo HTA conocida','Solo sin HTA conocida'],
-    index=0,
-)
-
-dm_filter = st.sidebar.radio(
-    "DM autoreportada",
-    options=['Todos','Solo DM conocida','Solo sin DM conocida'],
-    index=0,
-)
+with st.sidebar.expander("Filtros adicionales"):
+    bmi_opts = [o for o in df_raw['BMI_cat'].dropna().unique()
+                if o not in ('nan','None','')]
+    bmi_f = st.multiselect("Estado nutricional", bmi_opts, default=bmi_opts)
+    hta_r = st.radio("HTA autoreportada",
+        ['Todos','Solo HTA','Solo sin HTA'], index=0)
+    dm_r  = st.radio("DM autoreportada",
+        ['Todos','Solo DM','Solo sin DM'], index=0)
+    aines_r = st.radio("AINEs",
+        ['Todos','Solo uso diario','Sin uso diario'], index=0)
 
 # Aplicar filtros
 df = df_raw[
-    (df_raw['Age'].between(age_min, age_max)) &
-    (df_raw['Community'].isin(selected_comms)) &
-    (df_raw['PPOO_lbl'].isin(ppoo_filter)) &
-    (df_raw['Sex_lbl'].isin(sex_filter)) &
-    (df_raw['Weight_Category_clean'].isin(bmi_filter) | df_raw['Weight_Category_clean'].isna())
+    df_raw['Age'].between(age_min, age_max) &
+    df_raw['Community_std'].isin(sel_comms) &
+    (df_raw['PPOO_lbl'].isin(ppoo_f) | df_raw['PPOO_lbl'].isna()) &
+    df_raw['Sex_lbl'].isin(sex_f) &
+    (df_raw['Rural_lbl'].isin(rural_f) | df_raw['Rural_lbl'].isna()) &
+    (df_raw['BMI_cat'].isin(bmi_f) | df_raw['BMI_cat'].isna())
 ].copy()
-
-if hta_filter == 'Solo HTA conocida':
-    df = df[df['LE HAN DICHO QUE TIENE HTA'] == 1]
-elif hta_filter == 'Solo sin HTA conocida':
-    df = df[df['LE HAN DICHO QUE TIENE HTA'] == 0]
-
-if dm_filter == 'Solo DM conocida':
-    df = df[df['LE HAN DICHO QUE TIENE DM?'] == 1]
-elif dm_filter == 'Solo sin DM conocida':
-    df = df[df['LE HAN DICHO QUE TIENE DM?'] == 0]
+if hta_r == 'Solo HTA':   df = df[df['HTA_sr'] == 1]
+elif hta_r == 'Solo sin HTA': df = df[df['HTA_sr'] == 0]
+if dm_r  == 'Solo DM':    df = df[df['DM_sr'] == 1]
+elif dm_r == 'Solo sin DM':   df = df[df['DM_sr'] == 0]
+if aines_r == 'Solo uso diario': df = df[df['AINEs_diario_modelo'] == 1]
+elif aines_r == 'Sin uso diario': df = df[df['AINEs_diario_modelo'] == 0]
 
 st.sidebar.markdown("---")
-st.sidebar.metric("N tras filtros", f"{len(df):,}", f"{len(df)/len(df_raw)*100:.1f}% del total")
-
+st.sidebar.metric("N tras filtros", f"{len(df):,}",
+                  f"{len(df)/len(df_raw)*100:.1f}% del total")
 if len(df) < 20:
-    st.warning(f"⚠️ Muestra muy pequeña ({len(df)} registros). Los resultados serán inestables.")
+    st.warning(f"⚠️ Muestra muy pequeña ({len(df)} registros).")
 
 # ═══════════════════════════════════════════════════════════
-# HEADER PRINCIPAL
+# ENCABEZADO
 # ═══════════════════════════════════════════════════════════
 st.title("Estudio de prevalencia de ERC — Región de la Araucanía")
-st.caption("Dashboard interactivo · Muestra de screening en operativos comunitarios")
+st.caption("Dashboard interactivo v4.2.14 · eGFR CKD-EPI 2021 · Muestra de screening comunitario")
 
 # ═══════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════
-tab_overview, tab_prev, tab_strat, tab_subgrp, tab_risk, tab_score, tab_concord, tab_data = st.tabs([
+(tab_overview, tab_prev, tab_strat, tab_subgrp,
+ tab_risk, tab_score, tab_concord, tab_lit, tab_data) = st.tabs([
     "🏠 Resumen", "📊 Prevalencia", "🔬 Estratificación",
-    "👥 Subgrupos", "⚠️ Factores riesgo", "📈 Score de riesgo",
-    "🔄 Concordancia", "📋 Datos"
+    "🧩 Carga de riesgo", "⚠️ Factores riesgo", "📈 Score",
+    "🔄 Concordancia", "📖 Literatura", "📋 Datos",
 ])
 
 # ═══════════════════════════════════════════════════════════
@@ -283,89 +913,105 @@ tab_overview, tab_prev, tab_strat, tab_subgrp, tab_risk, tab_score, tab_concord,
 with tab_overview:
     st.header("Características de la muestra")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("N total", f"{len(df):,}")
-    edad_media = df['Age'].mean()
-    c2.metric("Edad media (años)", f"{edad_media:.1f}" if pd.notna(edad_media) else "—")
-    pct_m = (df['Sex']==1).sum()/df['Sex'].notna().sum()*100 if df['Sex'].notna().any() else 0
-    c3.metric("% Hombres", f"{pct_m:.1f}%")
-    pct_ppoo = (df['¿PPOO?']==1).sum()/df['¿PPOO?'].notna().sum()*100 if df['¿PPOO?'].notna().any() else 0
-    c4.metric("% PPOO", f"{pct_ppoo:.1f}%")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("N analítico", f"{len(df):,}")
+    c2.metric("Edad media", f"{df['Age'].mean():.1f} a")
+    c3.metric("% Mujeres",
+              f"{(df['Sex_lbl']=='Mujer').sum()/len(df)*100:.1f}%")
+    c4.metric("% PPOO",
+              f"{(df['PPOO_n']==1).sum()/df['PPOO_n'].notna().sum()*100:.1f}%"
+              if df['PPOO_n'].notna().any() else "—")
+    ckd_n = int((df['CKD60']==1).sum()); ckd_N = int(df['CKD60'].notna().sum())
+    p,l,h = wilson(ckd_n,ckd_N)
+    c5.metric("Prev. ERC (CKD-EPI 2021)",
+              f"{p:.1f}%" if pd.notna(p) else "—",
+              f"IC {l:.1f}–{h:.1f}")
 
-    st.markdown("### Prevalencias principales")
-    c1, c2, c3, c4 = st.columns(4)
+    st.markdown("### Prevalencias clave")
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(lbl,var,hlp) in zip([c1,c2,c3,c4],[
+        ("ERC eGFR<60","CKD60","Ecuación CKD-EPI 2021"),
+        ("ERC ampliada","CKD_exp","eGFR<60 O proteinuria+"),
+        ("HTA medida","HTA_meas","PA ≥130/80 mmHg"),
+        ("Proteinuria +","prot_pos","Tira reactiva positiva"),
+    ]):
+        n=int((df[var]==1).sum()); N=int(df[var].notna().sum())
+        pv,lo,hi=wilson(n,N)
+        col.metric(lbl, f"{pv:.1f}%" if pd.notna(pv) else "—",
+                   f"IC {lo:.1f}–{hi:.1f}" if pd.notna(lo) else "", help=hlp)
 
-    ckd_n = (df['CKD_eGFR_lt60']==1).sum()
-    ckd_N = df['CKD_eGFR_lt60'].notna().sum()
-    p, l, h = prev_ci_wilson(ckd_n, ckd_N)
-    c1.metric("ERC (eGFR<60)", f"{p:.1f}%" if pd.notna(p) else "—",
-              f"IC95% {l:.1f}–{h:.1f}" if pd.notna(l) else "")
-
-    ext_n = (df['CKD_extended']==1).sum()
-    ext_N = df['CKD_extended'].notna().sum()
-    p2, l2, h2 = prev_ci_wilson(ext_n, ext_N)
-    c2.metric("ERC ampliada", f"{p2:.1f}%" if pd.notna(p2) else "—",
-              f"IC95% {l2:.1f}–{h2:.1f}" if pd.notna(l2) else "",
-              help="eGFR<60 O proteinuria positiva")
-
-    hta_n = (df['HTA_measured']==1).sum()
-    hta_N = df['HTA_measured'].notna().sum()
-    p3, l3, h3 = prev_ci_wilson(hta_n, hta_N)
-    c3.metric("HTA medida", f"{p3:.1f}%" if pd.notna(p3) else "—",
-              f"IC95% {l3:.1f}–{h3:.1f}" if pd.notna(l3) else "")
-
-    ob_n = (df['Obesity']==1).sum()
-    ob_N = df['Obesity'].notna().sum()
-    p4, l4, h4 = prev_ci_wilson(ob_n, ob_N)
-    c4.metric("Obesidad", f"{p4:.1f}%" if pd.notna(p4) else "—",
-              f"IC95% {l4:.1f}–{h4:.1f}" if pd.notna(l4) else "")
-
-    st.markdown("### Pirámide poblacional")
-    pir_df = df.dropna(subset=['Age_group','Sex_lbl']).copy()
-    if len(pir_df):
+    col1,col2 = st.columns(2)
+    with col1:
+        st.markdown("### Pirámide etaria")
+        pir = df.dropna(subset=['Age_grp','Sex_lbl'])
         order = ['<30','30-44','45-59','60-74','≥75']
-        pir = pd.crosstab(pir_df['Age_group'], pir_df['Sex_lbl']).reindex(order).fillna(0)
-
+        ct = pd.crosstab(pir['Age_grp'], pir['Sex_lbl']).reindex(order).fillna(0)
         fig = go.Figure()
-        if 'Hombre' in pir.columns:
-            fig.add_trace(go.Bar(
-                y=pir.index, x=-pir.get('Hombre', 0),
-                name='Hombres', orientation='h', marker_color=C_MAIN,
-                hovertemplate='Hombres: %{customdata}<extra></extra>',
-                customdata=pir.get('Hombre', 0)
-            ))
-        if 'Mujer' in pir.columns:
-            fig.add_trace(go.Bar(
-                y=pir.index, x=pir.get('Mujer', 0),
-                name='Mujeres', orientation='h', marker_color=C_ACC,
-                hovertemplate='Mujeres: %{x}<extra></extra>',
-            ))
-        max_v = max(pir.max().max(), 1)
+        if 'Hombre' in ct.columns:
+            fig.add_trace(go.Bar(y=ct.index, x=-ct['Hombre'], name='Hombres',
+                orientation='h', marker_color=C_MAIN,
+                customdata=ct['Hombre'],
+                hovertemplate='Hombres: %{customdata}<extra></extra>'))
+        if 'Mujer' in ct.columns:
+            fig.add_trace(go.Bar(y=ct.index, x=ct['Mujer'], name='Mujeres',
+                orientation='h', marker_color=C_ACC,
+                hovertemplate='Mujeres: %{x}<extra></extra>'))
+        mx = max(ct.max().max(),1)
         fig.update_layout(
             barmode='relative',
-            xaxis=dict(
-                title='Cantidad',
-                tickvals=[-max_v, -max_v/2, 0, max_v/2, max_v],
-                ticktext=[str(int(max_v)), str(int(max_v/2)), '0', str(int(max_v/2)), str(int(max_v))]
-            ),
-            yaxis=dict(title='Grupo etario'),
-            height=400, margin=dict(l=10, r=10, t=20, b=20)
-        )
+            xaxis=dict(tickvals=[-mx,-mx/2,0,mx/2,mx],
+                       ticktext=[str(int(mx)),str(int(mx/2)),'0',str(int(mx/2)),str(int(mx))]),
+            height=360, margin=dict(l=10,r=10,t=10,b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Distribución de eGFR")
-    if df['eGFR_1st'].notna().any():
-        fig = px.histogram(
-            df.dropna(subset=['eGFR_1st']),
-            x='eGFR_1st', nbins=40, color_discrete_sequence=[C_MAIN]
-        )
-        fig.add_vline(x=60, line_dash="dash", line_color=C_ACC, annotation_text="60 mL/min/1.73m²")
-        fig.add_vline(x=90, line_dash="dot", line_color=C_GRAY)
-        fig.update_layout(
-            xaxis_title='eGFR (mL/min/1.73m²)',
-            yaxis_title='Frecuencia',
-            height=350, margin=dict(l=10, r=10, t=20, b=20)
-        )
+    with col2:
+        st.markdown("### Distribución eGFR (CKD-EPI 2021)")
+        if df['eGFR'].notna().any():
+            fig = px.histogram(df.dropna(subset=['eGFR']), x='eGFR', nbins=50,
+                               color_discrete_sequence=[C_TEAL])
+            fig.add_vline(x=60, line_dash='dash', line_color=C_ACC,
+                          annotation_text='60 mL/min')
+            fig.add_vline(x=90, line_dash='dot', line_color=C_GRAY,
+                          annotation_text='90 mL/min')
+            fig.update_layout(xaxis_title='eGFR CKD-EPI 2021 (mL/min/1.73m²)',
+                yaxis_title='N', height=360,
+                margin=dict(l=10,r=10,t=10,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            if df['eGFR_orig'].notna().any():
+                st.caption(
+                    f"⚡ CKD-EPI 2021 vs eGFR original: "
+                    f"casos eGFR<60 = {int((df['eGFR']<60).sum())} vs "
+                    f"{int((df['eGFR_orig']<60).sum())} "
+                    f"(+{int((df['eGFR']<60).sum()-( df['eGFR_orig']<60).sum())} "
+                    f"con nueva ecuación)")
+
+    # BMI detallado
+    st.markdown("### Estado nutricional — detalle por clase de obesidad")
+    if df['BMI_cat'].notna().any():
+        order_bmi = ['Bajo peso','Peso normal','Sobrepeso',
+                     'Obesidad clase I','Obesidad clase II','Obesidad clase III']
+        bmi_counts = df['BMI_cat'].value_counts().reindex(order_bmi).fillna(0)
+        bmi_pcts = bmi_counts / bmi_counts.sum() * 100
+        bmi_prev = []
+        for cat in order_bmi:
+            sv = df[df['BMI_cat']==cat].dropna(subset=['CKD60'])
+            n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+            bmi_prev.append(wilson(n,N)[0] if N>=5 else np.nan)
+        bmi_colors=['#88C640','#4DAF4A','#FFDD00','#F28F00','#E83800','#9E0000']
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Bar(x=order_bmi, y=bmi_counts.values,
+            marker_color=bmi_colors, opacity=0.8,
+            text=[f"{int(n)}" for n in bmi_counts.values],
+            textposition='outside', name='N'), secondary_y=False)
+        fig.add_trace(go.Scatter(x=order_bmi, y=bmi_prev,
+            mode='lines+markers', line=dict(color=C_ACC,width=2.5),
+            marker=dict(size=10), name='Prev ERC %',
+            text=[f"{p:.1f}%" if pd.notna(p) else "" for p in bmi_prev],
+            textposition='top center'), secondary_y=True)
+        fig.update_yaxes(title_text="N pacientes", secondary_y=False)
+        fig.update_yaxes(title_text="Prevalencia ERC (%)", secondary_y=True)
+        fig.update_layout(height=370, margin=dict(l=10,r=10,t=10,b=20),
+                          legend=dict(orientation='h',y=1.08))
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -375,100 +1021,110 @@ with tab_overview:
 with tab_prev:
     st.header("Prevalencia de ERC — definiciones operacionales")
 
-    rows = []
-    for label, var in [
-        ("ERC estricta (eGFR<60 mL/min/1.73m²)", 'CKD_eGFR_lt60'),
-        ("ERC ampliada (eGFR<60 O proteinuria+)", 'CKD_extended'),
-        ("Proteinuria positiva aislada", 'Proteinuria_pos'),
-        ("Hematuria positiva aislada", 'Hematuria_pos'),
+    rows=[]
+    for lbl,var in [
+        ("ERC presuntiva — eGFR CKD-EPI 2021 <60","CKD60"),
+        ("ERC ampliada (eGFR<60 O proteinuria+)","CKD_exp"),
+        ("Proteinuria positiva aislada","prot_pos"),
+        ("Hematuria positiva aislada","blood_pos"),
     ]:
-        n = (df[var]==1).sum()
-        N = df[var].notna().sum()
-        p, l, h = prev_ci_wilson(n, N)
-        rows.append([label, n, N, f"{p:.1f}%" if pd.notna(p) else "—",
+        n=int((df[var]==1).sum()); N=int(df[var].notna().sum())
+        p,l,h=wilson(n,N)
+        rows.append([lbl,n,N,f"{p:.1f}%" if pd.notna(p) else "—",
                      f"{l:.1f}–{h:.1f}" if pd.notna(l) else "—"])
-    prev_df = pd.DataFrame(rows, columns=['Definición', 'n', 'N', 'Prevalencia', 'IC95%'])
-    st.dataframe(prev_df, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows,
+        columns=['Definición','n','N','Prevalencia','IC95%']),
+        use_container_width=True, hide_index=True)
 
-    st.markdown("### Distribución por estadio KDIGO")
-    c1, c2 = st.columns([2, 1])
+    # Comparación ecuaciones
+    if df['eGFR_orig'].notna().any():
+        st.info(
+            f"**Impacto ecuación CKD-EPI 2021:** eGFR<60 original = "
+            f"{int((df['eGFR_orig']<60).sum())} ({(df['eGFR_orig']<60).sum()/df['eGFR_orig'].notna().sum()*100:.1f}%) → "
+            f"CKD-EPI 2021 = {int((df['eGFR']<60).sum())} ({(df['eGFR']<60).sum()/df['eGFR'].notna().sum()*100:.1f}%) "
+            f"(sin cap en 90, 14 casos reclasificados a <60 en la muestra completa)"
+        )
 
-    with c1:
-        if df['CKD_KDIGO_G'].notna().any():
-            order = ['G1','G2','G3a','G3b','G4','G5']
-            counts = df['CKD_KDIGO_G'].value_counts().reindex(order).fillna(0)
-            total = counts.sum()
-            pcts = counts/total*100 if total else counts
-            colors = [C_OK, C_LIGHT, '#F4E04D', '#F08C5A', C_ACC, '#7A1818']
+    st.markdown("### Distribución por estadio KDIGO G")
+    col1,col2 = st.columns([2,1])
+    with col1:
+        order=['G1','G2','G3a','G3b','G4','G5']
+        counts=df['KDIGO_G'].value_counts().reindex(order).fillna(0)
+        total=counts.sum()
+        fig=go.Figure()
+        fig.add_trace(go.Bar(
+            x=order, y=counts.values,
+            marker_color=[KDIGO_COLORS[g] for g in order],
+            text=[f"{int(c)}<br>({c/total*100:.1f}%)" for c in counts.values],
+            textposition='outside'))
+        fig.update_layout(xaxis_title='Estadio KDIGO G',
+            yaxis_title='N pacientes', showlegend=False,
+            height=400, margin=dict(l=10,r=10,t=30,b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=order, y=counts.values, marker_color=colors,
-                text=[f'{int(c)}<br>({p:.1f}%)' for c, p in zip(counts, pcts)],
-                textposition='outside'
-            ))
-            fig.update_layout(
-                xaxis_title='Estadio KDIGO G',
-                yaxis_title='Número de pacientes',
-                showlegend=False, height=400,
-                margin=dict(l=10, r=10, t=30, b=20)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
+    with col2:
         st.markdown("**Riesgo combinado KDIGO**")
-        if df['KDIGO_risk'].notna().any():
-            risk_counts = df['KDIGO_risk'].value_counts().reindex(
-                ['Bajo','Moderado','Alto','Muy alto']
-            ).fillna(0)
-            total = risk_counts.sum()
-            risk_colors_d = {'Bajo': C_OK, 'Moderado':'#F4E04D','Alto':'#F08C5A','Muy alto':C_ACC}
-
-            fig = go.Figure(go.Pie(
-                labels=risk_counts.index, values=risk_counts.values,
-                marker=dict(colors=[risk_colors_d[k] for k in risk_counts.index]),
-                hole=0.4,
-                textinfo='label+percent', textposition='outside'
-            ))
-            fig.update_layout(height=350, margin=dict(l=10, r=10, t=20, b=20), showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-            hi = ((df['KDIGO_risk']=='Alto') | (df['KDIGO_risk']=='Muy alto')).sum()
-            st.metric("Alto + Muy alto", f"{hi}", f"{hi/total*100:.1f}% del total" if total else "")
+        rc=df['KDIGO_risk'].value_counts().reindex(
+            ['Bajo','Moderado','Alto','Muy alto']).fillna(0)
+        fig=go.Figure(go.Pie(
+            labels=rc.index, values=rc.values,
+            marker=dict(colors=[RISK_COLORS[k] for k in rc.index]),
+            hole=0.45, textinfo='label+percent', textposition='outside'))
+        fig.update_layout(height=340,margin=dict(l=10,r=10,t=10,b=10),showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        hi=int(df['KDIGO_risk'].isin(['Alto','Muy alto']).sum())
+        tot=int(df['KDIGO_risk'].notna().sum())
+        st.metric("Alto + Muy alto", f"{hi}",
+                  f"{hi/tot*100:.1f}% del total" if tot else "")
 
     st.markdown("### Matriz KDIGO (eGFR × Albuminuria)")
-    sub = df.dropna(subset=['CKD_KDIGO_G', 'Albuminuria_cat'])
+    sub=df.dropna(subset=['KDIGO_G','Alb_cat'])
     if len(sub) > 0:
-        tab = pd.crosstab(sub['CKD_KDIGO_G'], sub['Albuminuria_cat'])
-        tab = tab.reindex(index=['G1','G2','G3a','G3b','G4','G5']).reindex(
-            columns=['A1 (Neg)','A2 (30 mg/dL)','A3 (≥100 mg/dL)']
-        ).fillna(0).astype(int)
+        tab_m = pd.crosstab(sub['KDIGO_G'],sub['Alb_cat']).reindex(
+            index=['G1','G2','G3a','G3b','G4','G5'],
+            columns=['A1','A2','A3']).fillna(0).astype(int)
+        risk_grid=pd.DataFrame([
+            ['Bajo','Moderado','Alto'],['Bajo','Moderado','Alto'],
+            ['Moderado','Alto','Muy alto'],['Alto','Muy alto','Muy alto'],
+            ['Muy alto','Muy alto','Muy alto'],['Muy alto','Muy alto','Muy alto'],
+        ], index=tab_m.index, columns=tab_m.columns)
 
-        risk_grid = pd.DataFrame([
-            ['Bajo','Moderado','Alto'],
-            ['Bajo','Moderado','Alto'],
-            ['Moderado','Alto','Muy alto'],
-            ['Alto','Muy alto','Muy alto'],
-            ['Muy alto','Muy alto','Muy alto'],
-            ['Muy alto','Muy alto','Muy alto'],
-        ], index=tab.index, columns=tab.columns)
-
-        risk_num = risk_grid.map({'Bajo':1,'Moderado':2,'Alto':3,'Muy alto':4}.get)
-
-        fig = go.Figure(go.Heatmap(
-            z=risk_num.values, x=tab.columns, y=tab.index,
-            colorscale=[[0,'#A8D5A0'],[0.33,'#F4E04D'],[0.66,'#F08C5A'],[1,'#C53030']],
-            showscale=False,
-            text=tab.values.astype(str), texttemplate='%{text}',
-            textfont=dict(size=14, color='white'),
-            hovertemplate='Estadio %{y} - %{x}: %{text}<extra></extra>'
-        ))
-        fig.update_layout(
-            xaxis_title='Albuminuria', yaxis_title='Estadio eGFR',
-            yaxis=dict(autorange='reversed'),
-            height=380, margin=dict(l=10, r=10, t=20, b=20)
-        )
+        # Color = categoría de riesgo KDIGO; intensidad = prevalencia de la celda.
+        total_m = tab_m.values.sum()
+        pct_m = tab_m / total_m * 100 if total_m else tab_m.astype(float)
+        max_pct = pct_m.values.max() if total_m else 0
+        x_labels = ['A1 (Neg)', 'A2 (30 mg/dL)', 'A3 (≥100)']
+        y_labels = list(tab_m.index)
+        fig = go.Figure()
+        for iy, g in enumerate(y_labels):
+            for ix, a in enumerate(tab_m.columns):
+                n_cell = int(tab_m.loc[g, a])
+                pct_cell = float(pct_m.loc[g, a]) if total_m else 0.0
+                risk = risk_grid.loc[g, a]
+                if n_cell == 0:
+                    fill = 'white'
+                    txt = ''
+                    hover = f'{g} + {x_labels[ix]}: sin datos'
+                else:
+                    intensity = 0.25 + 0.75*(pct_cell/max_pct) if max_pct > 0 else 0.25
+                    fill = blend_with_white(RISK_COLORS[risk], intensity)
+                    txt = f'<b>{n_cell}</b><br>{pct_cell:.1f}%'
+                    hover = f'{g} + {x_labels[ix]}: {n_cell} pacientes ({pct_cell:.1f}%)<br>Riesgo KDIGO: {risk}'
+                fig.add_shape(type='rect', x0=ix-0.5, x1=ix+0.5, y0=iy-0.5, y1=iy+0.5,
+                              line=dict(color='#FFFFFF', width=2), fillcolor=fill)
+                fig.add_annotation(x=ix, y=iy, text=txt, showarrow=False,
+                                   font=dict(size=13, color='#222222'))
+                fig.add_trace(go.Scatter(x=[ix], y=[iy], mode='markers',
+                                         marker=dict(size=40, color='rgba(0,0,0,0)'),
+                                         hovertemplate=hover + '<extra></extra>', showlegend=False))
+        fig.update_xaxes(tickmode='array', tickvals=list(range(len(x_labels))), ticktext=x_labels,
+                         title='Albuminuria', showgrid=False, zeroline=False)
+        fig.update_yaxes(tickmode='array', tickvals=list(range(len(y_labels))), ticktext=y_labels,
+                         title='Estadio eGFR', autorange='reversed', showgrid=False, zeroline=False)
+        fig.update_layout(height=400, margin=dict(l=10,r=10,t=10,b=20), plot_bgcolor='white')
         st.plotly_chart(fig, use_container_width=True)
+        st.caption('Color base según riesgo KDIGO; intensidad proporcional a la prevalencia dentro de la matriz. Celdas sin datos quedan en blanco.')
+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -477,215 +1133,454 @@ with tab_prev:
 with tab_strat:
     st.header("Prevalencia estratificada")
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        var_strat = st.selectbox(
-            "Variable de estratificación",
-            options=[
-                'Age_group', 'Sex_lbl', 'PPOO_lbl', 'Community',
-                'Weight_Category_clean', 'BP_Final',
-                'LE HAN DICHO QUE TIENE HTA', 'LE HAN DICHO QUE TIENE DM?',
-                'ANTEC. FLIAR ERC', 'TABACO',
-            ],
-            format_func=lambda x: {
-                'Age_group': 'Grupo etario',
-                'Sex_lbl': 'Sexo',
-                'PPOO_lbl': 'Pueblo originario',
-                'Community': 'Comuna',
-                'Weight_Category_clean': 'Estado nutricional',
-                'BP_Final': 'Categoría PA',
-                'LE HAN DICHO QUE TIENE HTA': 'HTA autoreportada',
-                'LE HAN DICHO QUE TIENE DM?': 'DM autoreportada',
-                'ANTEC. FLIAR ERC': 'Antecedente familiar ERC',
-                'TABACO': 'Tabaquismo',
-            }.get(x, x)
-        )
-        outcome = st.radio(
-            "Definición de ERC",
-            options=['CKD_eGFR_lt60', 'CKD_extended'],
-            format_func=lambda x: 'Estricta (eGFR<60)' if x=='CKD_eGFR_lt60' else 'Ampliada (incluye proteinuria)',
-        )
-        min_n = st.number_input("N mínimo por estrato", 1, 100, 5)
+    c_ctrl, c_plot = st.columns([1,3])
+    with c_ctrl:
+        var_opts = {
+            'Age_grp':'Grupo etario','Sex_lbl':'Sexo','PPOO_lbl':'Pueblo originario',
+            'Community_std':'Comuna','BMI_cat':'Estado nutricional (detallado)',
+            'BP_Final':'Categoría PA','HTA_sr':'HTA autoreportada',
+            'DM_sr':'DM autoreportada','FamHx_ERC':'Antec familiar ERC',
+            'Tabaco':'Tabaquismo','OH_b':'Consumo alcohol',
+            'Rural_lbl':'Ruralidad',
+        }
+        # Suma variables binarias estandarizadas 01-05 con frecuencia suficiente.
+        var_opts.update({c: humanize_varname(c) for c in standardized_binary_columns(df)})
+        var_s = st.selectbox("Variable principal eje X", list(var_opts.keys()),
+                             format_func=lambda x: var_opts.get(x,x))
+        var2_options = ['(Ninguna)'] + [v for v in var_opts.keys() if v != var_s]
+        var2_s = st.selectbox("Segunda variable opcional", var2_options,
+                              format_func=lambda x: 'Sin segunda variable' if x=='(Ninguna)' else var_opts.get(x,x))
+        outcome_s = st.radio("Definición ERC",
+            ['CKD60','CKD_exp'],
+            format_func=lambda x: 'Estricta (CKD-EPI 2021 <60)' if x=='CKD60'
+                                  else 'Ampliada (incl. proteinuria)')
+        min_n = st.number_input("N mínimo", 1, 100, 5)
+        st.caption("La segunda variable muestra barras agrupadas en paralelo para comparar prevalencia por subgrupo.")
 
-    with col2:
-        sub = df.dropna(subset=[var_strat, outcome])
-        if len(sub) == 0:
-            st.warning("Sin datos disponibles para esta variable con los filtros actuales.")
+    with c_plot:
+        group_cols = [var_s] if var2_s == '(Ninguna)' else [var_s, var2_s]
+        sub = df.dropna(subset=group_cols + [outcome_s]).copy()
+        if len(sub) < 5:
+            st.warning("Sin datos suficientes con estos filtros.")
         else:
-            grp = sub.groupby(var_strat).agg(n_ckd=(outcome, 'sum'), N=(outcome, 'size'))
-            grp = grp[grp['N'] >= min_n]
-            grp['prev'] = grp['n_ckd']/grp['N']*100
-            grp[['ci_lo','ci_hi']] = grp.apply(
-                lambda r: pd.Series(prev_ci_wilson(r['n_ckd'], r['N'])[1:]), axis=1
-            )
+            ordered={'Age_grp':['<30','30-44','45-59','60-74','≥75'],
+                     'BMI_cat':['Bajo peso','Peso normal','Sobrepeso',
+                                'Obesidad clase I','Obesidad clase II','Obesidad clase III']}
+            if var2_s == '(Ninguna)':
+                grp = sub.groupby(var_s).agg(n_ckd=(outcome_s,'sum'), N=(outcome_s,'size'))
+                grp = grp[grp['N'] >= min_n]
+                grp['prev'] = grp['n_ckd']/grp['N']*100
+                grp[['lo','hi']] = grp.apply(lambda r: pd.Series(wilson(r['n_ckd'],r['N'])[1:]), axis=1)
+                if var_s in ordered:
+                    grp=grp.reindex(ordered[var_s]).dropna(how='all')
+                else:
+                    grp=grp.sort_values('prev',ascending=False)
+                grp=grp.reset_index()
 
-            if var_strat == 'Age_group':
-                grp = grp.reindex(['<30','30-44','45-59','60-74','≥75']).dropna()
-            elif var_strat == 'Weight_Category_clean':
-                grp = grp.reindex(['bajo peso','peso normal','sobrepeso','obeso']).dropna()
+                fig=go.Figure()
+                fig.add_trace(go.Bar(
+                    x=grp[var_s].astype(str), y=grp['prev'],
+                    error_y=dict(type='data',array=grp['hi']-grp['prev'],
+                                 arrayminus=grp['prev']-grp['lo']),
+                    marker_color=C_MAIN))
+                labels_s=[f"{p:.1f}%<br>(n={int(N)})" for p,N in zip(grp['prev'],grp['N'])]
+                anns_s=bar_annotations(grp[var_s].astype(str).tolist(), grp['prev'].tolist(), grp['hi'].tolist(), labels_s)
+                fig.update_layout(yaxis_title='Prevalencia ERC (%)',
+                    height=420, margin=dict(l=10,r=10,t=50,b=20),
+                    showlegend=False, annotations=anns_s,
+                    yaxis=dict(range=[0, max(grp['hi'].max()*1.35, 5)]))
+                st.plotly_chart(fig, use_container_width=True)
+
+                test = smart_categorical_test(sub, var_s, outcome_s)
+                if pd.notna(test['p']):
+                    note = f" · {test['note']}" if test.get('note') else ""
+                    st.caption(f"**Test global:** {test['method']}, p = {format_p(test['p'])} "
+                               f"{'✓ diferencias entre grupos' if test['p']<0.05 else '✗ sin evidencia de diferencias'}{note}. "
+                               "Como el desenlace es binario, se comparan proporciones; la prevalencia graficada es el resumen por grupo.")
+                    ph = pairwise_categorical_posthoc(sub, var_s, outcome_s, min_n=min_n)
+                    if test['p'] < 0.05 and len(ph):
+                        sig_ph = ph[ph['Significativo']].copy()
+                        if len(sig_ph):
+                            st.caption("**Post hoc Holm:** diferencias significativas en " +
+                                       "; ".join(sig_ph['Comparación'].astype(str).head(6)) +
+                                       ("; …" if len(sig_ph)>6 else ""))
+                tbl=grp[[var_s,'n_ckd','N','prev','lo','hi']].copy()
+                tbl.columns=['Estrato','n ERC','N','Prev %','IC inf','IC sup']
+                tbl[['Prev %','IC inf','IC sup']]=tbl[['Prev %','IC inf','IC sup']].round(1)
+                st.dataframe(tbl, use_container_width=True, hide_index=True)
+                if pd.notna(test.get('p', np.nan)) and test['p'] < 0.05:
+                    ph_show = pairwise_categorical_posthoc(sub, var_s, outcome_s, min_n=min_n)
+                    if len(ph_show):
+                        ph_show['Δ prevalencia pp'] = ph_show['Δ prevalencia pp'].round(1)
+                        ph_show['p'] = ph_show['p'].round(4)
+                        ph_show['p ajustado Holm'] = ph_show['p ajustado Holm'].round(4)
+                        st.markdown("**Comparaciones post hoc entre grupos**")
+                        st.dataframe(style_sig(ph_show), use_container_width=True, hide_index=True)
             else:
-                grp = grp.sort_values('prev', ascending=False)
+                grp = sub.groupby([var_s, var2_s]).agg(n_ckd=(outcome_s,'sum'), N=(outcome_s,'size')).reset_index()
+                grp = grp[grp['N'] >= min_n].copy()
+                if len(grp) == 0:
+                    st.warning("No hay combinaciones con el N mínimo seleccionado.")
+                else:
+                    grp['prev'] = grp['n_ckd']/grp['N']*100
+                    grp[['lo','hi']] = grp.apply(lambda r: pd.Series(wilson(r['n_ckd'],r['N'])[1:]), axis=1)
+                    if var_s in ordered:
+                        grp[var_s] = pd.Categorical(grp[var_s], categories=ordered[var_s], ordered=True)
+                        grp = grp.sort_values([var_s, var2_s])
+                    else:
+                        order_x = grp.groupby(var_s)['prev'].mean().sort_values(ascending=False).index.tolist()
+                        grp[var_s] = pd.Categorical(grp[var_s], categories=order_x, ordered=True)
+                        grp = grp.sort_values([var_s, var2_s])
+                    fig = go.Figure()
 
-            grp = grp.reset_index()
+                    # Gráfico agrupado construido manualmente para controlar la posición
+                    # de las etiquetas. En Plotly, textposition='outside' ubica el texto
+                    # en el extremo de la barra y puede superponerse con las barras de error.
+                    # Aquí las etiquetas se agregan como anotaciones por encima del IC95%.
+                    x_order = grp[var_s].astype(str).drop_duplicates().tolist()
+                    levels2 = grp[var2_s].astype(str).drop_duplicates().tolist()
+                    colors2 = px.colors.qualitative.Plotly
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=grp[var_strat].astype(str), y=grp['prev'],
-                error_y=dict(type='data',
-                             array=grp['ci_hi']-grp['prev'],
-                             arrayminus=grp['prev']-grp['ci_lo']),
-                marker_color=C_MAIN,
-                text=[f'{p:.1f}%<br>(n={int(n)})' for p, n in zip(grp['prev'], grp['N'])],
-                textposition='outside'
-            ))
-            fig.update_layout(
-                yaxis_title='Prevalencia ERC (%)',
-                xaxis_title=var_strat,
-                height=400, margin=dict(l=10, r=10, t=30, b=20),
-                showlegend=False,
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                    label_y_values = []
+                    for j, level in enumerate(levels2):
+                        sg = grp[grp[var2_s].astype(str) == level].copy()
+                        color = colors2[j % len(colors2)]
+                        fig.add_trace(go.Bar(
+                            x=sg[var_s].astype(str),
+                            y=sg['prev'],
+                            name=str(level),
+                            offsetgroup=str(level),
+                            marker_color=color,
+                            error_y=dict(
+                                type='data',
+                                array=sg['hi'] - sg['prev'],
+                                arrayminus=sg['prev'] - sg['lo'],
+                                visible=True
+                            ),
+                            customdata=np.stack([sg['N'], sg['n_ckd'], sg['hi']], axis=-1),
+                            hovertemplate=(
+                                f"{var_opts.get(var_s, var_s)}: %{{x}}<br>"
+                                f"{var_opts.get(var2_s, var2_s)}: {level}<br>"
+                                "Prevalencia: %{y:.1f}%<br>"
+                                "N: %{customdata[0]}<br>"
+                                "n ERC: %{customdata[1]}<br>"
+                                "IC95% sup.: %{customdata[2]:.1f}%"
+                                "<extra></extra>"
+                            )
+                        ))
 
-            p_chi = chi2_pvalue(sub, var_strat, outcome)
-            if pd.notna(p_chi):
-                st.caption(f"**Test chi² entre estratos: p = {p_chi:.4f}** "
-                           f"{'(significativo)' if p_chi<0.05 else '(no significativo)'}")
+                        # Desplazamiento horizontal en píxeles para que las etiquetas
+                        # queden centradas sobre cada barra del grupo.
+                        xshift = (j - (len(levels2) - 1) / 2) * 42
+                        for _, r in sg.iterrows():
+                            y_label = float(r['hi']) + max(float(grp['hi'].max()) * 0.055, 1.2)
+                            label_y_values.append(y_label)
+                            fig.add_annotation(
+                                x=str(r[var_s]),
+                                y=y_label,
+                                xref='x',
+                                yref='y',
+                                text=f"{r['prev']:.1f}%<br>n={int(r['N'])}",
+                                showarrow=False,
+                                xanchor='center',
+                                yanchor='bottom',
+                                xshift=xshift,
+                                font=dict(size=11, color='#5F6680'),
+                                bgcolor='rgba(255,255,255,0.75)',
+                                borderpad=1
+                            )
 
-            tab_show = grp[[var_strat,'n_ckd','N','prev','ci_lo','ci_hi']].copy()
-            tab_show.columns = ['Estrato','n ERC','N','Prevalencia %','IC95% inf','IC95% sup']
-            tab_show['Prevalencia %'] = tab_show['Prevalencia %'].round(1)
-            tab_show['IC95% inf'] = tab_show['IC95% inf'].round(1)
-            tab_show['IC95% sup'] = tab_show['IC95% sup'].round(1)
-            st.dataframe(tab_show, use_container_width=True, hide_index=True)
+                    ymax = max(
+                        max(label_y_values) * 1.18 if label_y_values else 0,
+                        grp['hi'].max() * 1.65,
+                        8
+                    )
 
-    # Comparación PPOO × edad
+                    fig.update_layout(
+                        barmode='group',
+                        yaxis_title='Prevalencia ERC (%)',
+                        xaxis_title=var_opts.get(var_s, var_s),
+                        height=520,
+                        margin=dict(l=10, r=10, t=95, b=70),
+                        legend_title=var_opts.get(var2_s, var2_s),
+                        yaxis=dict(range=[0, ymax]),
+                    )
+                    fig.update_xaxes(categoryorder='array', categoryarray=x_order)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("Barras agrupadas por la segunda variable. La prueba global formal se mantiene para la variable principal; la comparación multivariable se recomienda interpretarla descriptivamente.")
+                    test = smart_categorical_test(sub, var_s, outcome_s)
+                    if pd.notna(test['p']):
+                        st.caption(f"**Test global variable principal:** {test['method']}, p = {format_p(test['p'])}.")
+                    tbl=grp[[var_s,var2_s,'n_ckd','N','prev','lo','hi']].copy()
+                    tbl.columns=['Estrato principal','Subgrupo','n ERC','N','Prev %','IC inf','IC sup']
+                    tbl[['Prev %','IC inf','IC sup']]=tbl[['Prev %','IC inf','IC sup']].round(1)
+                    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    # PPOO × Edad (estricta y ampliada)
     st.markdown("---")
-    st.markdown("### Comparación PPOO × edad")
-    sub = df.dropna(subset=['Age_group','PPOO_lbl', outcome])
-    if len(sub) > 0:
-        rows = []
-        for g in ['<30','30-44','45-59','60-74','≥75']:
-            for ppoo in ['PPOO','No PPOO']:
-                s = sub[(sub['Age_group']==g) & (sub['PPOO_lbl']==ppoo)]
-                if len(s) > 0:
-                    n = (s[outcome]==1).sum()
-                    p, lo, hi = prev_ci_wilson(n, len(s))
-                    rows.append({'Edad': g, 'PPOO': ppoo, 'prev': p, 'lo': lo, 'hi': hi, 'N': len(s)})
-        plot_df = pd.DataFrame(rows)
+    st.markdown("### PPOO × Edad — definición estricta vs ampliada")
+    col1,col2 = st.columns(2)
+    for col,out_v,lbl_v in [(col1,'CKD60','Estricta'),
+                             (col2,'CKD_exp','Ampliada')]:
+        with col:
+            sub2=df.dropna(subset=['Age_grp','PPOO_lbl',out_v])
+            rows2=[]
+            for g in ['<30','30-44','45-59','60-74','≥75']:
+                for ppoo in ['PPOO','No PPOO']:
+                    sv=sub2[(sub2['Age_grp']==g)&(sub2['PPOO_lbl']==ppoo)]
+                    if len(sv)<5: continue
+                    n=int((sv[out_v]==1).sum())
+                    p,lo,hi=wilson(n,len(sv))
+                    rows2.append({'Edad':g,'PPOO':ppoo,'prev':p,'lo':lo,'hi':hi,'N':len(sv)})
+            if rows2:
+                pdf=pd.DataFrame(rows2)
+                fig=px.bar(pdf,x='Edad',y='prev',color='PPOO',barmode='group',
+                    color_discrete_map={'PPOO':C_PPOO,'No PPOO':C_NOPP},
+                    error_y=pdf['hi']-pdf['prev'],
+                    category_orders={'Edad':['<30','30-44','45-59','60-74','≥75']},
+                    hover_data=['N'], title=f"Definición {lbl_v}")
+                fig.update_layout(yaxis_title='Prevalencia (%)',
+                    height=380, margin=dict(l=10,r=10,t=30,b=20))
+                col.plotly_chart(fig, use_container_width=True)
 
-        if len(plot_df) > 0:
-            fig = px.bar(
-                plot_df, x='Edad', y='prev', color='PPOO', barmode='group',
-                color_discrete_map={'PPOO': C_PPOO, 'No PPOO': C_NOPP},
-                error_y=plot_df['hi']-plot_df['prev'],
-                category_orders={'Edad': ['<30','30-44','45-59','60-74','≥75']},
-                hover_data=['N']
-            )
-            fig.update_layout(
-                yaxis_title='Prevalencia ERC (%)',
-                xaxis_title='Grupo etario',
-                height=400, margin=dict(l=10, r=10, t=20, b=20)
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    # Ruralidad + comunas
+    st.markdown("### Prevalencia comunal y ruralidad")
+    com_data=[]
+    for com in all_comms:
+        sv=df[df['Community_std']==com].dropna(subset=['CKD60'])
+        if len(sv)<10: continue
+        n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+        p,lo,hi=wilson(n,N)
+        r=RURALIDAD_CANONICA.get(com,np.nan)
+        com_data.append({'Comuna':com,'N':N,'Prev':p,'lo':lo,'hi':hi,
+                         'Ruralidad':r,'Rural':r>=30 if pd.notna(r) else False})
+    if com_data:
+        cdf=pd.DataFrame(com_data).sort_values('Ruralidad',ascending=False)
+        fig=go.Figure()
+        fig.add_trace(go.Bar(
+            x=cdf['Comuna'], y=cdf['Prev'],
+            error_y=dict(type='data',array=cdf['hi']-cdf['Prev'],
+                         arrayminus=cdf['Prev']-cdf['lo']),
+            marker_color=[C_RURAL if r else C_URBAN for r in cdf['Rural']],
+            text=[f"{p:.1f}%<br>({r:.0f}%R)" for p,r in
+                  zip(cdf['Prev'],cdf['Ruralidad'].fillna(0))],
+            textposition='outside',
+            hovertemplate='%{x}<br>ERC: %{y:.1f}%<extra></extra>'))
+        fig.update_layout(
+            xaxis_title='% Prevalencia ERC (% Ruralidad de la comuna)',
+            yaxis_title='Prevalencia eGFR<60 (%)',
+            height=420, margin=dict(l=10,r=10,t=10,b=60),
+            annotations=[dict(text='🟫 Rural ≥30%  🔵 Urbano <30%',
+                x=0.5,y=-0.20,xref='paper',yref='paper',showarrow=False,
+                font=dict(size=11))])
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════
 # TAB 4 — SUBGRUPOS
 # ═══════════════════════════════════════════════════════════
 with tab_subgrp:
-    st.header("Subgrupos críticos")
+    st.header("Carga y combinaciones de factores de riesgo")
 
-    # Score de carga acumulada de factores de riesgo
+    # Carga acumulada
     st.markdown("### Carga acumulada de factores de riesgo")
-    st.caption("Factores: edad≥60, HTA medida, DM (autoreporte o HGT>200), obesidad, antec familiar ERC")
+    st.caption("Factores: edad≥60, HTA medida, DM (autoreporte o HGT>200), obesidad, antec. familiar ERC")
 
-    rf_vars = {
-        'rf_age':  (df['Age']>=60).astype(float),
-        'rf_hta':  (df['HTA_measured']==1).astype(float).where(df['HTA_measured'].notna()),
-        'rf_dm':   ((df['LE HAN DICHO QUE TIENE DM?']==1) | (df['Glucose_high']==1)).astype(float),
-        'rf_ob':   (df['Obesity']==1).astype(float).where(df['Obesity'].notna()),
-        'rf_fam':  (df['ANTEC. FLIAR ERC']==1).astype(float).where(df['ANTEC. FLIAR ERC'].notna()),
-    }
-    df['RiskScore_n'] = pd.DataFrame(rf_vars).sum(axis=1, min_count=3)
-    df['RiskScore_lbl'] = pd.cut(df['RiskScore_n'], bins=[-1,0,1,2,5], labels=['0','1','2','≥3'])
+    # Cada factor se codifica como 0/1 y luego se suma.  La categoría final agrupa
+    # explícitamente a todos los pacientes con 3, 4 o 5 factores presentes.
+    rf_components = pd.DataFrame({
+        'Edad ≥60': (df['Age'] >= 60).astype(float),
+        'HTA medida': df['HTA_meas'].fillna(0).astype(float),
+        'DM autorep/HGT>200': ((df['DM_sr'] == 1) | (df['Glc200'] == 1)).astype(float),
+        'Obesidad': df['Obesity'].fillna(0).astype(float),
+        'Antecedente familiar ERC': df['FamHx_ERC'].fillna(0).astype(float),
+    }, index=df.index)
 
-    sub = df.dropna(subset=['CKD_eGFR_lt60','RiskScore_lbl'])
+    df['n_rf'] = rf_components.sum(axis=1)
+    rf_order = ['0', '1', '2', '≥3']
+
+    # Crear categorías de carga acumulada de forma robusta.
+    # Se evita np.select para no mezclar tipos texto/NaN y se fuerza que
+    # la categoría ≥3 exista siempre como nivel del eje X, aunque alguna
+    # combinación de filtros deje pocos o ningún caso en esa categoría.
+    df['RF_lbl'] = pd.cut(
+        df['n_rf'],
+        bins=[-0.1, 0.5, 1.5, 2.5, np.inf],
+        labels=rf_order,
+        ordered=True
+    )
+
+    sub = df.dropna(subset=['CKD60', 'RF_lbl']).copy()
+    sub['RF_lbl'] = pd.Categorical(sub['RF_lbl'].astype(str), categories=rf_order, ordered=True)
     if len(sub) > 0:
-        rows = []
-        for s in ['0','1','2','≥3']:
-            sg = sub[sub['RiskScore_lbl']==s]
+        rows3 = []
+        for lbl in rf_order:
+            sg = sub[sub['RF_lbl'] == lbl]
+            n = int((sg['CKD60'] == 1).sum()) if len(sg) else 0
             if len(sg):
-                n = (sg['CKD_eGFR_lt60']==1).sum()
-                p, lo, hi = prev_ci_wilson(n, len(sg))
-                rows.append({'Score': s, 'prev': p, 'lo': lo, 'hi': hi, 'N': len(sg), 'n_ckd': n})
-        sc = pd.DataFrame(rows)
+                p, lo, hi = wilson(n, len(sg))
+            else:
+                p, lo, hi = (0, 0, 0)
+            rows3.append({'Score': lbl, 'prev': p, 'lo': lo, 'hi': hi, 'N': len(sg), 'n ERC': n})
 
-        if len(sc) > 0:
+        sdf = pd.DataFrame(rows3)
+        sdf['Score'] = pd.Categorical(sdf['Score'].astype(str), categories=rf_order, ordered=True)
+        sdf = sdf.sort_values('Score').reset_index(drop=True)
+        if len(sdf):
+            # Usar posiciones numéricas evita que Plotly interprete mal la etiqueta "≥3"
+            # y asegura que la cuarta barra se dibuje siempre. El eje se rotula con ticktext.
+            sdf['xpos'] = range(len(rf_order))
+
             fig = go.Figure()
             fig.add_trace(go.Bar(
-                x=sc['Score'], y=sc['prev'],
-                error_y=dict(type='data', array=sc['hi']-sc['prev'], arrayminus=sc['prev']-sc['lo']),
-                marker_color=[C_LIGHT,'#7FA89C',C_MAIN,C_ACC],
-                text=[f'{p:.1f}%<br>(n={N})' for p, N in zip(sc['prev'], sc['N'])],
-                textposition='outside'
+                x=sdf['xpos'].astype(int).tolist(),
+                y=sdf['prev'].astype(float).tolist(),
+                width=0.62,
+                error_y=dict(
+                    type='data',
+                    array=(sdf['hi'] - sdf['prev']).astype(float).tolist(),
+                    arrayminus=(sdf['prev'] - sdf['lo']).astype(float).tolist()
+                ),
+                marker_color=[RISK_COLORS['Bajo'], RISK_COLORS['Moderado'],
+                              RISK_COLORS['Alto'], RISK_COLORS['Muy alto']],
+                customdata=sdf[['Score', 'N', 'n ERC', 'lo', 'hi']].astype(str).values,
+                hovertemplate=(
+                    'N° factores: %{customdata[0]}<br>'
+                    'Prevalencia: %{y:.1f}%<br>'
+                    'N: %{customdata[1]}<br>'
+                    'n ERC: %{customdata[2]}<br>'
+                    'IC95%: %{customdata[3]}–%{customdata[4]}<extra></extra>'
+                )
             ))
+
+            anns_rf = bar_annotations(
+                sdf['xpos'].astype(int).tolist(),
+                sdf['prev'].tolist(),
+                sdf['hi'].tolist(),
+                [f"{p:.1f}%<br>n={N}" for p, N in zip(sdf['prev'], sdf['N'])]
+            )
+
+            y_max_rf = max(float(sdf['hi'].max()) * 1.35, 5)
             fig.update_layout(
-                yaxis_title='Prevalencia ERC (%)',
                 xaxis_title='N° factores de riesgo presentes',
-                height=400, margin=dict(l=10, r=10, t=30, b=20)
+                yaxis_title='Prevalencia ERC (%)',
+                annotations=anns_rf,
+                yaxis=dict(range=[0, y_max_rf]),
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=list(range(len(rf_order))),
+                    ticktext=rf_order,
+                    range=[-0.5, len(rf_order) - 0.5]
+                ),
+                height=380,
+                margin=dict(l=10, r=10, t=50, b=20)
             )
             st.plotly_chart(fig, use_container_width=True)
 
+            n_ge3 = int(sdf.loc[sdf['Score'].astype(str).eq('≥3'), 'N'].sum())
+            st.caption(f"La columna **≥3** agrupa a quienes presentan tres o más factores de riesgo simultáneos. N ≥3 = {n_ge3}.")
+
+            tbl_rf = sdf[['Score', 'n ERC', 'N', 'prev', 'lo', 'hi']].copy()
+            tbl_rf.columns = ['N° factores', 'n ERC', 'N', 'Prev %', 'IC inf', 'IC sup']
+            tbl_rf[['Prev %', 'IC inf', 'IC sup']] = tbl_rf[['Prev %', 'IC inf', 'IC sup']].round(1)
+            with st.expander("Ver tabla de carga acumulada", expanded=False):
+                st.dataframe(tbl_rf, use_container_width=True, hide_index=True)
+
+            test_rf = smart_categorical_test(sub, 'RF_lbl', 'CKD60')
+            if pd.notna(test_rf['p']):
+                note = f" · {test_rf['note']}" if test_rf.get('note') else ""
+                st.caption(f"**Test global:** {test_rf['method']}, p = {format_p(test_rf['p'])} "
+                           f"{'✓ la prevalencia cambia con la carga de factores' if test_rf['p']<0.05 else '✗ sin evidencia de diferencias'}{note}.")
+                ph_rf = pairwise_categorical_posthoc(sub, 'RF_lbl', 'CKD60', min_n=5)
+                if test_rf['p'] < 0.05 and len(ph_rf):
+                    ph_rf['Δ prevalencia pp'] = ph_rf['Δ prevalencia pp'].round(1)
+                    ph_rf['p'] = ph_rf['p'].round(4)
+                    ph_rf['p ajustado Holm'] = ph_rf['p ajustado Holm'].round(4)
+                    st.dataframe(style_sig(ph_rf), use_container_width=True, hide_index=True)
+
+    # Combinaciones clínicas
     st.markdown("### Combinaciones clínicas críticas")
-    combos = [
-        ('Sin factores conocidos (<60 sin HTA/DM/obesidad)',
-         (df['Age']<60) & (df['LE HAN DICHO QUE TIENE HTA']==0) &
-         (df['LE HAN DICHO QUE TIENE DM?']==0) & (df['Obesity']==0)),
-        ('Edad ≥60 sin HTA/DM/obesidad',
-         (df['Age']>=60) & (df['LE HAN DICHO QUE TIENE HTA']==0) &
-         (df['LE HAN DICHO QUE TIENE DM?']==0) & (df['Obesity']==0)),
-        ('DM + Obesidad',
-         (df['LE HAN DICHO QUE TIENE DM?']==1) & (df['Obesity']==1)),
-        ('HTA + Obesidad',
-         (df['LE HAN DICHO QUE TIENE HTA']==1) & (df['Obesity']==1)),
-        ('HTA + DM (autoreporte)',
-         (df['LE HAN DICHO QUE TIENE HTA']==1) & (df['LE HAN DICHO QUE TIENE DM?']==1)),
-        ('HTA + DM + Obesidad',
-         (df['LE HAN DICHO QUE TIENE HTA']==1) &
-         (df['LE HAN DICHO QUE TIENE DM?']==1) & (df['Obesity']==1)),
-        ('Edad≥60 + HTA + DM',
-         (df['Age']>=60) & (df['LE HAN DICHO QUE TIENE HTA']==1) &
-         (df['LE HAN DICHO QUE TIENE DM?']==1)),
-        ('Antec familiar + Proteinuria+',
-         (df['ANTEC. FLIAR ERC']==1) & (df['Proteinuria_pos']==1)),
+    st.caption(
+        "Los subgrupos se definen solo por antecedentes, exposiciones o condiciones basales. "
+        "La variable eGFR<60 no se utiliza para formar combinaciones, porque corresponde al desenlace ERC."
+    )
+    combos=[
+        ("Sin factores conocidos",
+         (df['Age']<60)&(df['HTA_sr']==0)&(df['DM_sr']==0)&(df['Obesity']==0)),
+        ("Edad ≥60 sin HTA/DM/obesidad",
+         (df['Age']>=60)&(df['HTA_sr']==0)&(df['DM_sr']==0)&(df['Obesity']==0)),
+        ("DM + Obesidad",(df['DM_sr']==1)&(df['Obesity']==1)),
+        ("HTA + Obesidad",(df['HTA_sr']==1)&(df['Obesity']==1)),
+        ("HTA + DM",(df['HTA_sr']==1)&(df['DM_sr']==1)),
+        ("HTA + DM + Obesidad",
+         (df['HTA_sr']==1)&(df['DM_sr']==1)&(df['Obesity']==1)),
+        ("Edad ≥60 + HTA + DM",
+         (df['Age']>=60)&(df['HTA_sr']==1)&(df['DM_sr']==1)),
+        ("Antec familiar ERC + Proteinuria+",
+         (df['FamHx_ERC']==1)&(df['prot_pos']==1)),
     ]
-    rows = []
-    for lbl, mask in combos:
-        s = df[mask.fillna(False)].dropna(subset=['CKD_eGFR_lt60'])
-        n = (s['CKD_eGFR_lt60']==1).sum()
-        N = len(s)
-        if N >= 5:
-            p, lo, hi = prev_ci_wilson(n, N)
-            rows.append({'Combinación': lbl, 'N': N, 'n_ERC': n,
-                         'Prevalencia': p, 'lo': lo, 'hi': hi})
-    if rows:
-        cdf = pd.DataFrame(rows).sort_values('Prevalencia')
-        fig = go.Figure(go.Bar(
-            y=cdf['Combinación'], x=cdf['Prevalencia'],
-            orientation='h', marker_color=C_LIGHT,
-            error_x=dict(type='data', array=cdf['hi']-cdf['Prevalencia'],
-                         arrayminus=cdf['Prevalencia']-cdf['lo']),
-            text=[f'{p:.1f}% (n={n})' for p, n in zip(cdf['Prevalencia'], cdf['N'])],
-            textposition='outside'
-        ))
-        prev_global, _, _ = prev_ci_wilson((df['CKD_eGFR_lt60']==1).sum(),
-                                           df['CKD_eGFR_lt60'].notna().sum())
-        if pd.notna(prev_global):
-            fig.add_vline(x=prev_global, line_dash='dash', line_color='black',
-                          annotation_text=f"Global {prev_global:.1f}%")
+    # AINEs si está disponible
+    # Nota: eGFR<60 NO se usa como criterio para definir subgrupos aquí,
+    # porque CKD60 es el desenlace. Usarlo en la máscara produciría una
+    # prevalencia artificialmente igual a 100%.
+    if df['AINEs_diario_modelo'].notna().any():
+        combos.append(("AINEs diarios",
+                       (df['AINEs_diario_modelo'] == 1)))
+        combos.append(("Edad ≥60 + AINEs diarios",
+                       (df['Age'] >= 60) & (df['AINEs_diario_modelo'] == 1)))
+    rows4=[]
+    for lbl,mask in combos:
+        sv=df[mask.fillna(False)].dropna(subset=['CKD60'])
+        n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+        if N>=5:
+            p,lo,hi=wilson(n,N)
+            rows4.append({'Combinación':lbl,'N':N,'n ERC':n,'Prev':p,'lo':lo,'hi':hi})
+    if rows4:
+        cdf2=pd.DataFrame(rows4).sort_values('Prev')
+        pglobal=wilson(int((df['CKD60']==1).sum()),int(df['CKD60'].notna().sum()))[0]
+        fig=go.Figure(go.Bar(
+            y=cdf2['Combinación'], x=cdf2['Prev'], orientation='h',
+            error_x=dict(type='data',array=cdf2['hi']-cdf2['Prev'],
+                         arrayminus=cdf2['Prev']-cdf2['lo']),
+            marker_color=C_LIGHT))
+        anns_c=bar_annotations(cdf2['Combinación'].tolist(), cdf2['Prev'].tolist(),
+            cdf2['hi'].tolist(),
+            [f"{p:.1f}% (n={n})" for p,n in zip(cdf2['Prev'],cdf2['N'])],
+            is_horizontal=True)
+        global_ann = []
+
+        xmax = cdf2['hi'].max() * 1.5
+        if pd.notna(pglobal):
+            xmax = max(xmax, pglobal * 1.35)
+
+            fig.add_vline(
+                x=pglobal,
+                line_dash='dash',
+                line_color='black'
+            )
+
+            global_ann.append(dict(
+                x=pglobal,
+                y=1.08,
+                xref='x',
+                yref='paper',
+                text=f"Global {pglobal:.1f}%",
+                showarrow=False,
+                xanchor='left',
+                yanchor='bottom',
+                font=dict(size=11, color='black'),
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='black',
+                borderwidth=0.5,
+                borderpad=3
+            ))
+
         fig.update_layout(
-            xaxis_title='Prevalencia ERC (%)', yaxis_title='',
-            height=450, margin=dict(l=10, r=80, t=20, b=20)
+            xaxis_title='Prevalencia (%)',
+            xaxis=dict(range=[0, xmax]),
+            annotations=anns_c + global_ann,
+            height=430,
+            margin=dict(l=10, r=160, t=60, b=20)
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -695,418 +1590,698 @@ with tab_subgrp:
 # ═══════════════════════════════════════════════════════════
 with tab_risk:
     st.header("Factores de riesgo")
+    st.caption(
+        "Esta sección estima razones de prevalencia (RP) para ERC presuntiva definida como eGFR CKD-EPI 2021 <60. "
+        "En estudios transversales, la RP es más interpretable que un OR cuando la prevalencia no es rara."
+    )
 
-    st.markdown("### RR crudo por factor (eGFR<60)")
-    risk_factors = [
-        ('LE HAN DICHO QUE TIENE HTA', 'HTA conocida (autoreporte)'),
-        ('LE HAN DICHO QUE TIENE DM?', 'DM conocida (autoreporte)'),
-        ('HTA_measured', 'HTA medida (PA≥130/80)'),
-        ('Glucose_high', 'Glicemia >200'),
-        ('Obesity', 'Obesidad (IMC≥30)'),
-        ('HISTORIA PERSONAL LITIASIS', 'Litiasis previa'),
-        ('ITU RECURRENTE', 'ITU recurrente'),
-        ('ANTEC. FLIAR ERC', 'Antec familiar ERC'),
-        ('Proteinuria_pos', 'Proteinuria (+)'),
-        ('Hematuria_pos', 'Hematuria (+)'),
-        ('TABACO', 'Tabaquismo'),
-        ('OH', 'Consumo OH'),
-        ('¿PPOO?', 'Pueblo originario'),
+    df = add_rural_binary(df)
+
+    st.markdown("### Asociación entre factores clínicos basales y ERC")
+
+    rf_list = [
+        ('HTA_sr','HTA conocida (autoreporte)'),
+        ('DM_sr','DM conocida (autoreporte)'),
+        ('HTA_meas','HTA medida (PA≥130/80)'),
+        ('Glc200','Glicemia >200 mg/dL'),
+        ('Obesity','Obesidad (cualquier clase)'),
+        ('Litiasis_global','Litiasis previa (global)'),
+        ('ITU_global','ITU recurrente / pielonefritis (global)'),
+        ('FamHx_ERC','Antec familiar ERC (combinado)'),
+        ('prot_pos','Proteinuria (+)'),
+        ('blood_pos','Hematuria (+)'),
+        ('Tabaco_global','Tabaquismo (global)'),
+        ('OH_global','Consumo OH problemático/global'),
+        ('PPOO_n','Pueblo originario'),
+        ('Rural_bin','Ruralidad ≥30%'),
+        ('AINEs_diario_modelo','AINEs uso diario (Planilla 03, canónico)'),
+        ('Monorreno','Monorreno / asimetría renal'),
+        ('Cardio','Cardiopatía / cardiovascular (global)'),
+        ('Tiroides','Patología tiroidea (global)'),
+        ('DLP_dg','DLP / hipertrigliceridemia (global)'),
     ]
-    rows = []
-    for var, lbl in risk_factors:
-        sub = df.dropna(subset=[var, 'CKD_eGFR_lt60'])
-        if len(sub) < 10:
-            continue
-        ex = sub[sub[var]==1]; nx = sub[sub[var]==0]
-        if len(ex)<5 or len(nx)<5:
-            continue
-        eck = (ex['CKD_eGFR_lt60']==1).sum(); nck = (nx['CKD_eGFR_lt60']==1).sum()
-        if eck==0 or nck==0:
-            rows.append({'Factor': lbl, 'RR': np.nan, 'lo': np.nan, 'hi': np.nan,
-                         'p': np.nan, 'prev_ex': eck/len(ex)*100,
-                         'prev_nx': nck/len(nx)*100, 'n_ex': len(ex), 'n_nx': len(nx)})
-            continue
-        rr = (eck/len(ex)) / (nck/len(nx))
-        se = np.sqrt(1/eck - 1/len(ex) + 1/nck - 1/len(nx))
-        lo = np.exp(np.log(rr) - 1.96*se)
-        hi = np.exp(np.log(rr) + 1.96*se)
-        p = chi2_pvalue(sub, var, 'CKD_eGFR_lt60')
-        rows.append({'Factor': lbl, 'RR': rr, 'lo': lo, 'hi': hi, 'p': p,
-                     'prev_ex': eck/len(ex)*100, 'prev_nx': nck/len(nx)*100,
-                     'n_ex': len(ex), 'n_nx': len(nx)})
 
-    if rows:
-        rf_df = pd.DataFrame(rows).dropna(subset=['RR']).sort_values('RR')
+    # Variables estandarizadas basales/exploratorias. Se excluyen Eval_, Accion_, Acción_, Pesquisa_
+    # y flags de revisión/dato faltante porque no representan exposición basal.
+    std_groups = {
+        'Antecedentes personales / diagnósticos': ('antecedentes',),
+        'Antecedentes familiares': ('familiares',),
+        'AINEs estandarizados': ('aines',),
+    }
 
-        fig = go.Figure()
-        for _, r in rf_df.iterrows():
-            color = C_ACC if r['lo'] > 1 else (C_OK if r['hi'] < 1 else C_GRAY)
-            fig.add_trace(go.Scatter(
-                x=[r['lo'], r['hi']], y=[r['Factor'], r['Factor']],
-                mode='lines', line=dict(color=color, width=2),
-                showlegend=False, hoverinfo='skip'
-            ))
-            fig.add_trace(go.Scatter(
-                x=[r['RR']], y=[r['Factor']], mode='markers',
-                marker=dict(color=color, size=12,
-                            line=dict(color='white', width=1.5)),
-                showlegend=False,
-                hovertemplate=f"<b>{r['Factor']}</b><br>RR={r['RR']:.2f} ({r['lo']:.2f}–{r['hi']:.2f})<br>p={r['p']:.4f}<extra></extra>"
-            ))
-        fig.add_vline(x=1, line_dash='dash', line_color='gray')
-        fig.update_layout(
-            xaxis=dict(title='Riesgo Relativo (escala log)', type='log'),
-            yaxis=dict(title=''),
-            height=500, margin=dict(l=10, r=10, t=20, b=20)
+    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    with c1:
+        source_sel = st.selectbox(
+            "Conjunto de variables",
+            ['Factores clínicos predefinidos'] + list(std_groups.keys())
         )
+    with c2:
+        ajuste_sel = st.selectbox(
+            "Tipo de estimación",
+            ['Crudo', 'Ajustado por edad + sexo',
+             'Ajustado por edad + sexo + PPOO',
+             'Ajustado por edad + sexo + PPOO + ruralidad']
+        )
+    with c3:
+        max_vars = st.number_input("Máximo de variables a mostrar", min_value=5, max_value=60, value=25, step=5)
+
+    ajuste_map = {
+        'Crudo': [],
+        'Ajustado por edad + sexo': ['Age', 'Sex_M'],
+        'Ajustado por edad + sexo + PPOO': ['Age', 'Sex_M', 'PPOO_n'],
+        'Ajustado por edad + sexo + PPOO + ruralidad': ['Age', 'Sex_M', 'PPOO_n', 'Rural_bin'],
+    }
+    covars = ajuste_map[ajuste_sel]
+
+    if source_sel == 'Factores clínicos predefinidos':
+        vars_to_model = [(v, l) for v, l in rf_list if v in df.columns]
+    else:
+        std_cols = standardized_risk_columns(df, include_groups=std_groups[source_sel])
+        vars_to_model = [(c, humanize_varname(c)) for c in std_cols]
+
+    pr_df = prevalence_ratio_table(df, vars_to_model, outcome='CKD60', covariates=covars)
+
+    if len(pr_df):
+        pr_df = pr_df.sort_values('RP', ascending=False).head(int(max_vars)).copy()
+        fig = plot_pr_forest(pr_df, title_x=f"Razón de prevalencias — {ajuste_sel.lower()} (escala log)")
         st.plotly_chart(fig, use_container_width=True)
 
-        rf_df_show = rf_df[['Factor','prev_ex','prev_nx','RR','lo','hi','p']].round(3)
-        rf_df_show.columns = ['Factor','%ERC expuestos','%ERC no expuestos','RR','IC inf','IC sup','p']
-        st.dataframe(rf_df_show, use_container_width=True, hide_index=True)
+        tbl = pr_df[['Factor','Variable','N modelo','N expuestos','N no expuestos',
+                     'n ERC expuestos','n ERC no exp.','%ERC expuestos','%ERC no exp.',
+                     'RP','IC inf','IC sup','p','Método','Ajuste']].copy()
+        for c in ['%ERC expuestos','%ERC no exp.','RP','IC inf','IC sup','p']:
+            tbl[c] = tbl[c].round(3)
+        st.dataframe(style_sig(tbl.rename(columns={'RP':'RP/RR'})), use_container_width=True, hide_index=True)
+
+        if ajuste_sel == 'Crudo':
+            st.caption(
+                "Estimación cruda: prevalencia de ERC en expuestos dividida por prevalencia de ERC en no expuestos. "
+                "El IC95% usa aproximación logarítmica."
+            )
+        else:
+            st.caption(
+                "Estimación ajustada: modelo de Poisson con enlace log y varianza robusta HC3. "
+                "Las variables usadas como ajuste se omiten automáticamente si coinciden con la exposición evaluada."
+            )
+    else:
+        st.info(
+            "No hay variables con frecuencia suficiente para este conjunto y nivel de ajuste. "
+            "La app exige al menos 5 expuestos, 5 no expuestos y casos de ERC en ambos grupos."
+        )
 
     st.markdown("---")
-    st.markdown("### Regresión logística multivariada")
-
-    dat = df[['CKD_eGFR_lt60','Age','Sex','¿PPOO?','Obesity',
-              'LE HAN DICHO QUE TIENE HTA','LE HAN DICHO QUE TIENE DM?',
-              'ANTEC. FLIAR ERC','Proteinuria_pos']].copy()
-    dat.columns = ['ckd','age','sex','ppoo','obese','hta_sr','dm_sr','famhx','prot']
-    dat = dat.dropna()
-    dat['ckd'] = dat['ckd'].fillna(0).astype(int)
-
-    if len(dat) < 50 or dat['ckd'].sum() < 10:
-        st.warning(f"Muestra insuficiente para regresión (N={len(dat)}, eventos={dat['ckd'].sum() if len(dat) else 0}).")
+    st.markdown("### Variables estandarizadas excluidas del análisis de riesgo")
+    st.caption(
+        "Las columnas derivadas de evaluación médica, acciones clínicas o pesquisa no se interpretan como factores de riesgo. "
+        "Además, se omiten flags auxiliares como revisar manual, dato faltante, sin información o antecedentes no especificados. "
+        "Estas variables se reservan para análisis de cascada clínica, calidad de datos o conducta posterior."
+    )
+    excluded_prefixes = ('Eval_', 'Accion_', 'Acción_', 'Pesquisa_')
+    candidate_prefixes = ('OtraCondicion_', 'AF_', 'Dg_', 'AINEs_', 'Eval_', 'Accion_', 'Acción_', 'Pesquisa_')
+    excluded_cols = [c for c in df.columns if c.startswith(excluded_prefixes) or (c.startswith(candidate_prefixes) and is_nonanalytic_indicator_name(c))]
+    excluded_cols = sorted(set(excluded_cols))
+    if excluded_cols:
+        excl_tbl = pd.DataFrame({
+            'Variable excluida': excluded_cols,
+            'Etiqueta': [humanize_varname(c) for c in excluded_cols],
+            'Motivo': ['Evaluación/acción/pesquisa' if c.startswith(excluded_prefixes) else 'Flag auxiliar / revisión / dato faltante' for c in excluded_cols],
+            'N válidos': [int(df[c].notna().sum()) for c in excluded_cols],
+            'N positivos': [int(pd.to_numeric(df[c], errors='coerce').sum(skipna=True)) if is_binary_series(df[c]) else np.nan for c in excluded_cols],
+        })
+        st.dataframe(excl_tbl, use_container_width=True, hide_index=True)
     else:
-        try:
-            model = smf.logit('ckd ~ age + sex + ppoo + obese + hta_sr + dm_sr + famhx + prot', data=dat).fit(disp=0)
-            or_tab = pd.DataFrame({
-                'OR': np.exp(model.params),
-                'IC inf': np.exp(model.conf_int()[0]),
-                'IC sup': np.exp(model.conf_int()[1]),
-                'p': model.pvalues
-            }).drop('Intercept')
+        st.info("No se detectaron columnas excluidas en los datos actualmente cargados.")
 
-            labels_map = {
-                'age':'Edad (por año)','sex':'Sexo masculino','ppoo':'Pueblo originario',
-                'obese':'Obesidad','hta_sr':'HTA autoreporte','dm_sr':'DM autoreporte',
-                'famhx':'Antec familiar ERC','prot':'Proteinuria (+)'
-            }
-            or_tab.index = or_tab.index.map(lambda x: labels_map.get(x, x))
-
-            fig = go.Figure()
-            for var in or_tab.index:
-                row = or_tab.loc[var]
-                color = C_ACC if row['IC inf'] > 1 else (C_OK if row['IC sup'] < 1 else C_GRAY)
-                fig.add_trace(go.Scatter(
-                    x=[row['IC inf'], row['IC sup']], y=[var, var],
-                    mode='lines', line=dict(color=color, width=2),
-                    showlegend=False, hoverinfo='skip'
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[row['OR']], y=[var], mode='markers',
-                    marker=dict(color=color, size=12, line=dict(color='white', width=1.5)),
-                    showlegend=False,
-                    hovertemplate=f"<b>{var}</b><br>OR={row['OR']:.2f} ({row['IC inf']:.2f}–{row['IC sup']:.2f})<br>p={row['p']:.4f}<extra></extra>"
-                ))
-            fig.add_vline(x=1, line_dash='dash', line_color='gray')
-            fig.update_layout(
-                xaxis=dict(title='Odds Ratio ajustado (escala log)', type='log'),
-                yaxis_title='', height=400, margin=dict(l=10, r=10, t=20, b=20)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"N={len(dat)} | Pseudo-R² McFadden = {model.prsquared:.3f} | AIC = {model.aic:.1f}")
-
-            or_show = or_tab.round(3).reset_index().rename(columns={'index':'Variable'})
-            st.dataframe(or_show, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error(f"No se pudo ajustar el modelo: {e}")
+    # Subdiagnóstico
+    st.markdown("---")
+    st.markdown("### Brechas de diagnóstico (subdiagnóstico)")
+    hta_d=int((df['HTA_meas']==1).sum())
+    hta_c=int(((df['HTA_meas']==1)&(df['HTA_sr']==1)).sum())
+    dm_d=int((df['Glc200']==1).sum())
+    dm_c=int(((df['Glc200']==1)&(df['DM_sr']==1)).sum())
+    ckd_c_sub=df[df['CKD60']==1]
+    tto_disp=ckd_c_sub[ckd_c_sub['TTO_ERC_b'].notna()]
+    n_tto=len(tto_disp); n_kno=int((tto_disp['TTO_ERC_b']==1).sum())
+    tbl_sub=pd.DataFrame([
+        ['HTA (PA≥130/80)',hta_d,hta_c,hta_d-hta_c,
+         f"{(hta_d-hta_c)/hta_d*100:.1f}%" if hta_d else "—"],
+        ['DM (HGT>200)',dm_d,dm_c,dm_d-dm_c,
+         f"{(dm_d-dm_c)/dm_d*100:.1f}%" if dm_d else "—"],
+        [f'ERC eGFR<60 (sobre n={n_tto} con TTO_ERC disponible)',
+         n_tto,n_kno,n_tto-n_kno,
+         f"{(n_tto-n_kno)/n_tto*100:.1f}%" if n_tto else "—"],
+    ], columns=['Condición','N detectados','Conocidos','Nuevos','% nuevos'])
+    st.dataframe(tbl_sub, use_container_width=True, hide_index=True)
+    st.caption("El campo TTO_ERC tiene 84% de faltantes entre casos eGFR<60; la cifra defendible es sobre los casos con dato disponible.")
 
 
 # ═══════════════════════════════════════════════════════════
-# TAB 6 — SCORE DE RIESGO
+# TAB 6 — SCORE
 # ═══════════════════════════════════════════════════════════
 with tab_score:
-    st.header("Score de riesgo para tamizaje")
-
+    st.header("Score clínico de riesgo para tamizaje")
     st.markdown("""
-    **Score propuesto (rango 0–13 puntos)**
+    **Score v4 — 4 variables | rango 0–8 puntos**
 
     | Variable | Puntos |
     |---|---|
-    | Edad <45 / 45–59 / 60–74 / ≥75 | 0 / 2 / 4 / 6 |
-    | Sexo masculino | 1 |
-    | Obesidad (IMC ≥30) | 1 |
-    | HTA conocida (autoreporte) | 1 |
-    | Antecedente familiar de ERC | 1 |
+    | Edad <45 / 45–59 / 60–74 / ≥75 | 0 / 1 / 2 / 4 |
     | Proteinuria (+) | 2 |
+    | Obesidad (cualquier clase) | 1 |
+    | Antecedente familiar ERC | 1 |
+
+    *Score de priorización, no de diagnóstico. Pendiente de validación externa.*
     """)
 
-    def age_pts(a):
-        if pd.isna(a): return np.nan
-        if a < 45: return 0
-        elif a < 60: return 2
-        elif a < 75: return 4
-        else: return 6
-
-    sc_df = df.copy()
-    sc_df['s_age'] = sc_df['Age'].apply(age_pts)
-    sc_df['s_sex'] = (sc_df['Sex'].fillna(0)==1).astype(int)
-    sc_df['s_ob']  = (sc_df['Obesity'].fillna(0)==1).astype(int)
-    sc_df['s_hta'] = (sc_df['LE HAN DICHO QUE TIENE HTA'].fillna(0)==1).astype(int)
-    sc_df['s_fam'] = (sc_df['ANTEC. FLIAR ERC'].fillna(0)==1).astype(int)
-    sc_df['s_prot']= (sc_df['Proteinuria_pos'].fillna(0)==1).astype(int)*2
-
-    sc_df['Score'] = (sc_df[['s_age','s_sex','s_ob','s_hta','s_fam','s_prot']].sum(axis=1))
-    sc_df.loc[sc_df['Age'].isna(), 'Score'] = np.nan
-
-    valid = sc_df.dropna(subset=['Score','CKD_eGFR_lt60'])
-    if len(valid) < 50:
-        st.warning(f"Muestra insuficiente para el score (N válidos={len(valid)}).")
+    val=df.dropna(subset=['SCORE','CKD60']).copy()
+    val['ckd']=val['CKD60'].fillna(0).astype(int)
+    if len(val)<50:
+        st.warning(f"Muestra insuficiente (N={len(val)}).")
     else:
-        valid['ckd'] = valid['CKD_eGFR_lt60'].fillna(0).astype(int)
-
-        c1, c2 = st.columns(2)
+        c1,c2=st.columns(2)
         with c1:
-            grp = valid.groupby('Score').agg(n=('ckd','size'), n_ckd=('ckd','sum'))
-            grp['prev'] = grp['n_ckd']/grp['n']*100
-
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_trace(go.Bar(
-                x=grp.index, y=grp['n'], name='N pacientes',
-                marker_color=C_LIGHT, opacity=0.7
-            ), secondary_y=False)
-            fig.add_trace(go.Scatter(
-                x=grp.index, y=grp['prev'],
-                name='Prevalencia ERC', mode='lines+markers+text',
-                line=dict(color=C_ACC, width=3),
-                marker=dict(size=10),
-                text=[f'{p:.0f}%' for p in grp['prev']], textposition='top center',
-            ), secondary_y=True)
-            fig.update_xaxes(title_text='Score (puntos)')
-            fig.update_yaxes(title_text='N pacientes', secondary_y=False)
-            fig.update_yaxes(title_text='Prevalencia ERC (%)', secondary_y=True, range=[0,110])
-            fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=20),
-                              legend=dict(orientation='h', y=1.1))
+            grp_s=val.groupby('SCORE').agg(n=('ckd','size'),nckd=('ckd','sum'))
+            grp_s['prev']=grp_s['nckd']/grp_s['n']*100
+            fig=make_subplots(specs=[[{"secondary_y":True}]])
+            fig.add_trace(go.Bar(x=grp_s.index,y=grp_s['n'],
+                name='N pac.',marker_color=C_LGRAY,opacity=0.8),secondary_y=False)
+            fig.add_trace(go.Scatter(x=grp_s.index,y=grp_s['prev'],
+                name='Prev ERC %',mode='lines+markers+text',
+                line=dict(color=C_ACC,width=3),marker=dict(size=10),
+                text=[f"{p:.0f}%" for p in grp_s['prev']],
+                textposition='top center'),secondary_y=True)
+            fig.update_xaxes(title_text='Puntaje')
+            fig.update_yaxes(title_text='N pacientes',secondary_y=False)
+            fig.update_yaxes(title_text='Prevalencia (%)',secondary_y=True,range=[0,100])
+            fig.update_layout(height=400,margin=dict(l=10,r=10,t=30,b=20),
+                              legend=dict(orientation='h',y=1.1))
             st.plotly_chart(fig, use_container_width=True)
 
         with c2:
             try:
-                auc = roc_auc_score(valid['ckd'], valid['Score'])
-                fpr, tpr, thr = roc_curve(valid['ckd'], valid['Score'])
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=fpr, y=tpr, mode='lines',
-                    line=dict(color=C_MAIN, width=2.5),
-                    name=f'Score (AUC={auc:.3f})'
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[0,1], y=[0,1], mode='lines',
-                    line=dict(color=C_GRAY, dash='dash'),
-                    name='No discriminación', showlegend=True
-                ))
-                fig.update_layout(
-                    xaxis_title='1 - Especificidad',
-                    yaxis_title='Sensibilidad',
-                    height=400, margin=dict(l=10, r=10, t=30, b=20),
-                    legend=dict(x=0.55, y=0.1)
-                )
+                auc=roc_auc_score(val['ckd'],val['SCORE'])
+                fpr,tpr,_=roc_curve(val['ckd'],val['SCORE'])
+                fig=go.Figure()
+                fig.add_trace(go.Scatter(x=fpr,y=tpr,mode='lines',
+                    line=dict(color=C_MAIN,width=2.5),name=f'AUC={auc:.3f}'))
+                fig.add_trace(go.Scatter(x=[0,1],y=[0,1],mode='lines',
+                    line=dict(color=C_GRAY,dash='dash'),name='No discrim.',showlegend=True))
+                fig.update_layout(xaxis_title='1-Especificidad',
+                    yaxis_title='Sensibilidad',height=400,
+                    margin=dict(l=10,r=10,t=30,b=20),legend=dict(x=0.55,y=0.1))
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
-                st.error(f"No se pudo calcular AUC: {e}")
+                st.error(str(e))
 
-        st.markdown("### Características operativas por punto de corte")
-        rows = []
-        for cut in sorted(valid['Score'].unique()):
-            pred = (valid['Score'] >= cut).astype(int)
-            tp = ((pred==1) & (valid['ckd']==1)).sum()
-            fn = ((pred==0) & (valid['ckd']==1)).sum()
-            fp = ((pred==1) & (valid['ckd']==0)).sum()
-            tn = ((pred==0) & (valid['ckd']==0)).sum()
-            sens = tp/(tp+fn) if (tp+fn) else 0
-            esp  = tn/(tn+fp) if (tn+fp) else 0
-            vpp  = tp/(tp+fp) if (tp+fp) else 0
-            vpn  = tn/(tn+fn) if (tn+fn) else 0
-            nnd  = 1/vpp if vpp>0 else np.inf
-            rows.append({
-                'Cutoff': f'≥{int(cut)}',
-                'N tamizado': tp+fp,
-                'VP': tp,'FN': fn,'FP': fp,'VN': tn,
-                'Sensibilidad': round(sens,2),
-                'Especificidad': round(esp,2),
-                'VPP': round(vpp,2),
-                'VPN': round(vpn,2),
-                'NND': round(nnd,1) if not np.isinf(nnd) else '—'
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        # Estratos
+        def estr(s):
+            if s<=0: return 'Bajo (0)'
+            if s<=2: return 'Intermedio (1-2)'
+            if s<=4: return 'Alto (3-4)'
+            return 'Muy alto (≥5)'
+        val['estr']=val['SCORE'].apply(estr)
+        estr_order=['Bajo (0)','Intermedio (1-2)','Alto (3-4)','Muy alto (≥5)']
+        e_rows=[]
+        for e in estr_order:
+            sv=val[val['estr']==e]
+            n=int(sv['ckd'].sum()); N=int(len(sv))
+            p,lo,hi=wilson(n,N)
+            e_rows.append({'Estrato':e,'N':N,'n ERC':n,
+                           'Prevalencia %':f"{p:.1f}%",
+                           'IC95%':f"{lo:.1f}–{hi:.1f}"})
+        st.dataframe(pd.DataFrame(e_rows), use_container_width=True, hide_index=True)
 
+        # Tabla de cortes
+        st.markdown("### Características operativas por corte")
+        cut_rows=[]
+        for c in sorted(val['SCORE'].dropna().unique()):
+            pred=(val['SCORE']>=c).astype(int)
+            tp=int(((pred==1)&(val['ckd']==1)).sum())
+            fn=int(((pred==0)&(val['ckd']==1)).sum())
+            fp=int(((pred==1)&(val['ckd']==0)).sum())
+            tn=int(((pred==0)&(val['ckd']==0)).sum())
+            sens=tp/(tp+fn) if tp+fn else 0
+            esp=tn/(tn+fp) if tn+fp else 0
+            vpp=tp/(tp+fp) if tp+fp else 0
+            cut_rows.append({'Corte':f'≥{int(c)}','Sens':round(sens,2),
+                'Esp':round(esp,2),'VPP':round(vpp,2),
+                '% priorizado':round((tp+fp)/(tp+fp+fn+tn)*100,1)})
+        st.dataframe(pd.DataFrame(cut_rows), use_container_width=True, hide_index=True)
+
+        # Calculadora
         st.markdown("### 🧮 Calculadora individual")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            i_age = st.slider("Edad", 18, 100, 55)
-            i_sex = st.radio("Sexo", ['Mujer','Hombre'], horizontal=True)
-        with col2:
-            i_ob = st.checkbox("Obesidad (IMC ≥30)")
-            i_hta = st.checkbox("HTA conocida")
-        with col3:
-            i_fam = st.checkbox("Antec familiar ERC")
-            i_prot = st.checkbox("Proteinuria (+)")
-
-        score_user = (
-            age_pts(i_age) +
-            (1 if i_sex=='Hombre' else 0) +
-            (1 if i_ob else 0) +
-            (1 if i_hta else 0) +
-            (1 if i_fam else 0) +
-            (2 if i_prot else 0)
-        )
-        # Buscar prevalencia en el bin más cercano
-        bin_prev = valid[valid['Score']==score_user]
-        if len(bin_prev) > 0:
-            prev_at_score = (bin_prev['ckd']==1).sum()/len(bin_prev)*100
-        else:
-            prev_at_score = np.nan
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Score total", score_user)
-        c2.metric("Prevalencia ERC en este score",
-                  f"{prev_at_score:.1f}%" if pd.notna(prev_at_score) else "—",
-                  help=f"Calculada sobre {len(bin_prev)} pacientes con score={score_user}")
-        nivel = ('Bajo' if score_user<=2 else
-                 'Intermedio' if score_user<=5 else
-                 'Alto' if score_user<=7 else 'Muy alto')
-        c3.metric("Categoría de riesgo", nivel)
+        c1,c2,c3=st.columns(3)
+        with c1:
+            i_age=st.slider("Edad",18,100,55)
+        with c2:
+            i_ob=st.checkbox("Obesidad (cualquier clase)")
+            i_fam=st.checkbox("Antec familiar ERC")
+        with c3:
+            i_prot=st.checkbox("Proteinuria (+)")
+        def apt(a):
+            return 0 if a<45 else (1 if a<60 else (2 if a<75 else 4))
+        sc_u=apt(i_age)+(2 if i_prot else 0)+(1 if i_ob else 0)+(1 if i_fam else 0)
+        bp=val[val['SCORE']==sc_u]
+        prev_u=(bp['ckd']==1).sum()/len(bp)*100 if len(bp)>0 else np.nan
+        c1,c2,c3=st.columns(3)
+        c1.metric("Score total",sc_u)
+        c2.metric("Prev ERC en este score",
+                  f"{prev_u:.1f}%" if pd.notna(prev_u) else "—",
+                  help=f"n={len(bp)} con score={sc_u}")
+        nivel=('Bajo' if sc_u<=0 else 'Intermedio' if sc_u<=2
+               else 'Alto' if sc_u<=4 else 'Muy alto')
+        c3.metric("Categoría",nivel)
 
 
 # ═══════════════════════════════════════════════════════════
 # TAB 7 — CONCORDANCIA
 # ═══════════════════════════════════════════════════════════
 with tab_concord:
-    st.header("Concordancia eGFR 1ra vs 2da toma")
+    st.header("Concordancia eGFR 1ª vs 2ª medición (CKD-EPI 2021)")
 
-    sub = df.dropna(subset=['eGFR_1st','eGFR_2nd']).copy()
-    if len(sub) < 5:
-        st.warning(f"Solo {len(sub)} pacientes con segunda toma — insuficiente para análisis.")
+    sub_c=df.dropna(subset=['eGFR','eGFR_2nd']).copy()
+    if len(sub_c)<5:
+        st.warning(f"Solo {len(sub_c)} registros con segunda toma.")
     else:
-        sub['delta'] = sub['eGFR_2nd'] - sub['eGFR_1st']
-        sub['mean']  = (sub['eGFR_1st']+sub['eGFR_2nd'])/2
-        bias = sub['delta'].mean()
-        sd = sub['delta'].std()
-        loa_lo, loa_hi = bias-1.96*sd, bias+1.96*sd
+        d=sub_c['eGFR_2nd']-sub_c['eGFR']
+        bias=d.mean(); sd_d=d.std()
+        lo_ba=bias-1.96*sd_d; hi_ba=bias+1.96*sd_d
+        rp=pearsonr(sub_c['eGFR'],sub_c['eGFR_2nd'])
+        rs=spearmanr(sub_c['eGFR'],sub_c['eGFR_2nd'])
+        mx,my=sub_c['eGFR'].mean(),sub_c['eGFR_2nd'].mean()
+        sx,sy=sub_c['eGFR'].std(ddof=0),sub_c['eGFR_2nd'].std(ddof=0)
+        cov_v=((sub_c['eGFR']-mx)*(sub_c['eGFR_2nd']-my)).mean()
+        ccc=2*cov_v/(sx**2+sy**2+(mx-my)**2) if (sx**2+sy**2+(mx-my)**2)>0 else np.nan
 
-        try:
-            r_p, p_p = stats.pearsonr(sub['eGFR_1st'], sub['eGFR_2nd'])
-        except Exception:
-            r_p, p_p = (np.nan, np.nan)
+        c1,c2,c3,c4,c5=st.columns(5)
+        c1.metric("N pares",len(sub_c))
+        c2.metric("Bias (Δ)",f"{bias:+.2f}")
+        c3.metric("Pearson r",f"{rp[0]:.3f}")
+        c4.metric("Spearman ρ",f"{rs[0]:.3f}")
+        c5.metric("Lin's CCC",f"{ccc:.3f}" if pd.notna(ccc) else "—",
+                  help="<0.90 = pobre concordancia")
 
-        mx, my = sub['eGFR_1st'].mean(), sub['eGFR_2nd'].mean()
-        sx, sy = sub['eGFR_1st'].std(ddof=0), sub['eGFR_2nd'].std(ddof=0)
-        cov = ((sub['eGFR_1st']-mx)*(sub['eGFR_2nd']-my)).mean()
-        denom = sx**2+sy**2+(mx-my)**2
-        ccc = 2*cov/denom if denom > 0 else np.nan
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("N con ambas tomas", len(sub))
-        c2.metric("Bias (Δ eGFR)", f"{bias:+.2f}")
-        c3.metric("Pearson r", f"{r_p:.3f}" if pd.notna(r_p) else "—")
-        c4.metric("Lin's CCC", f"{ccc:.3f}" if pd.notna(ccc) else "—",
-                  help="<0.90 = pobre")
-
-        col1, col2 = st.columns(2)
+        col1,col2=st.columns(2)
         with col1:
-            st.markdown("**Scatter + diagonal**")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=sub['eGFR_1st'], y=sub['eGFR_2nd'],
+            st.markdown("**Scatter — línea de identidad**")
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=sub_c['eGFR'],y=sub_c['eGFR_2nd'],
                 mode='markers',
-                marker=dict(color=C_MAIN, size=8, line=dict(color='white', width=1)),
-                hovertemplate='1ra: %{x:.0f}<br>2da: %{y:.0f}<extra></extra>'
-            ))
-            mn, mx_ = min(sub['eGFR_1st'].min(), sub['eGFR_2nd'].min()), max(sub['eGFR_1st'].max(), sub['eGFR_2nd'].max())
-            fig.add_trace(go.Scatter(x=[mn,mx_], y=[mn,mx_], mode='lines',
-                                     line=dict(color=C_GRAY, dash='dash'),
-                                     name='Línea de identidad', showlegend=False))
-            fig.add_hline(y=60, line_color=C_ACC, line_dash='dot')
-            fig.add_vline(x=60, line_color=C_ACC, line_dash='dot')
-            fig.update_layout(
-                xaxis_title='eGFR 1ra toma', yaxis_title='eGFR 2da toma',
-                height=400, margin=dict(l=10, r=10, t=20, b=20)
-            )
+                marker=dict(color=C_TEAL,size=8,line=dict(color='white',width=1)),
+                hovertemplate='1ª: %{x:.0f}<br>2ª: %{y:.0f}<extra></extra>'))
+            mn=min(sub_c['eGFR'].min(),sub_c['eGFR_2nd'].min())
+            mx_=max(sub_c['eGFR'].max(),sub_c['eGFR_2nd'].max())
+            fig.add_trace(go.Scatter(x=[mn,mx_],y=[mn,mx_],mode='lines',
+                line=dict(color=C_GRAY,dash='dash'),showlegend=False))
+            fig.add_hline(y=60,line_color=C_ACC,line_dash='dot')
+            fig.add_vline(x=60,line_color=C_ACC,line_dash='dot')
+            fig.update_layout(xaxis_title='eGFR 1ª toma (CKD-EPI 2021)',
+                yaxis_title='eGFR 2ª toma',height=400,margin=dict(l=10,r=10,t=10,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
             st.markdown("**Bland-Altman**")
+            mean_v=(sub_c['eGFR']+sub_c['eGFR_2nd'])/2
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=mean_v,y=d,mode='markers',
+                marker=dict(color=C_TEAL,size=8,line=dict(color='white',width=1)),
+                hovertemplate='Media: %{x:.0f}<br>Δ: %{y:.1f}<extra></extra>'))
+            fig.add_hline(y=bias,line_color='black',
+                          annotation_text=f'Bias={bias:.1f}')
+            fig.add_hline(y=hi_ba,line_color=C_ACC,line_dash='dash',
+                          annotation_text=f'+1.96DE={hi_ba:.1f}')
+            fig.add_hline(y=lo_ba,line_color=C_ACC,line_dash='dash',
+                          annotation_text=f'-1.96DE={lo_ba:.1f}')
+            fig.update_layout(xaxis_title='Promedio (1ª+2ª)/2',
+                yaxis_title='Δ (2ª-1ª)',height=400,margin=dict(l=10,r=10,t=10,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+        sub_c['b1']=(sub_c['eGFR']<60).fillna(False).astype(int)
+        sub_c['b2']=(sub_c['eGFR_2nd']<60).fillna(False).astype(int)
+        tab_reclasif=pd.crosstab(
+            sub_c['b1'].map({0:'≥60 (1ª)',1:'<60 (1ª)'}),
+            sub_c['b2'].map({0:'≥60 (2ª)',1:'<60 (2ª)'}),margins=True)
+        st.markdown("### Reclasificación binaria (eGFR<60)")
+        st.dataframe(tab_reclasif, use_container_width=True)
+        g1_k=sub_c['eGFR'].apply(kdigo_g); g2_k=sub_c['eGFR_2nd'].apply(kdigo_g)
+        same_k=int((g1_k==g2_k).sum())
+        st.caption(f"Misma categoría KDIGO G: {same_k}/{len(sub_c)} ({same_k/len(sub_c)*100:.1f}%)")
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 8 — LITERATURA (análisis extra)
+# ═══════════════════════════════════════════════════════════
+with tab_lit:
+    st.header("Análisis derivados de la literatura nefrológica")
+    st.caption("Zúñiga 2011 · Walbaum 2020 · Meneses 2023 · Poblete 2024")
+
+    sub_t = st.radio("Selecciona análisis",
+        ["ERC oculta","Correlación eGFR-Edad","U invertida KDIGO",
+         "Etiología presuntiva","Interacción DM × HTA",
+         "AINEs y función renal","Subdiagnóstico en HTA/DM (PSCV proxy)"],
+        horizontal=True)
+
+    if sub_t == "ERC oculta":
+        st.markdown("### ERC oculta — Zúñiga 2011")
+        st.info("Definición: eGFR<60 con creatinina capilar ≤1,0 mg/dL. Pacientes con daño renal oculto bajo una creatinina aparentemente normal — riesgo de prescripción de nefrotóxicos.")
+        ckd_cases=df[df['CKD60']==1]
+        eo_n=int((ckd_cases['Creatinine_1st']<=1.0).sum())
+        eo_N=int(ckd_cases['Creatinine_1st'].notna().sum())
+        p,lo,hi=wilson(eo_n,eo_N)
+        c1,c2,c3=st.columns(3)
+        c1.metric("ERC oculta",f"{eo_n} casos",f"{p:.1f}% de eGFR<60")
+        c2.metric("IC95%",f"{lo:.1f}–{hi:.1f}%")
+        c3.metric("Referencia Zúñiga 2011","26,8%",
+                  "MDRD-4, APS Concepción — diferencia por ecuación")
+        # Por sexo y edad
+        rows_eo=[]
+        for sex in ['Mujer','Hombre']:
+            sv=ckd_cases[ckd_cases['Sex_lbl']==sex]
+            n=int((sv['Creatinine_1st']<=1.0).sum()); N=int(sv['Creatinine_1st'].notna().sum())
+            p2,lo2,hi2=wilson(n,N)
+            rows_eo.append({'Subgrupo':sex,'n ERC oculta':n,'N eGFR<60':N,
+                            'Prevalencia':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
+        for g in ['<30','30-44','45-59','60-74','≥75']:
+            sv=ckd_cases[ckd_cases['Age_grp']==g]
+            n=int((sv['Creatinine_1st']<=1.0).sum()); N=int(sv['Creatinine_1st'].notna().sum())
+            p2,lo2,hi2=wilson(n,N)
+            rows_eo.append({'Subgrupo':f"Edad {g}",'n ERC oculta':n,'N eGFR<60':N,
+                            'Prevalencia':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
+        st.dataframe(pd.DataFrame(rows_eo), use_container_width=True, hide_index=True)
+
+    elif sub_t == "Correlación eGFR-Edad":
+        st.markdown("### Correlación continua eGFR–Edad — Zúñiga 2011")
+        sub_cr=df.dropna(subset=['eGFR','Age'])
+        rp_v,pp_v=pearsonr(sub_cr['Age'],sub_cr['eGFR'])
+        rs_v,ps_v=spearmanr(sub_cr['Age'],sub_cr['eGFR'])
+        c1,c2,c3=st.columns(3)
+        c1.metric("Pearson r",f"{rp_v:.3f}","p<0.001")
+        c2.metric("Spearman ρ",f"{rs_v:.3f}")
+        c3.metric("Referencia Zúñiga 2011","r = –0,54","MDRD-4, APS Concepción")
+        samp=sub_cr.sample(min(800,len(sub_cr)),random_state=42)
+        lr=linregress(samp['Age'],samp['eGFR'])
+        x_r=np.linspace(samp['Age'].min(),samp['Age'].max(),100)
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=samp['Age'],y=samp['eGFR'],mode='markers',
+            marker=dict(color=samp['eGFR'],colorscale='RdYlGn',cmin=10,cmax=130,
+                        size=5,opacity=0.5,showscale=True,colorbar=dict(title='eGFR')),
+            hovertemplate='Edad %{x}<br>eGFR %{y:.0f}<extra></extra>',showlegend=False))
+        fig.add_trace(go.Scatter(x=x_r,y=lr.slope*x_r+lr.intercept,mode='lines',
+            line=dict(color=C_MAIN,width=2.5),name=f"r = {rp_v:.3f}"))
+        fig.add_hline(y=60,line_color=C_ACC,line_dash='dash',
+                      annotation_text='eGFR 60')
+        fig.update_layout(xaxis_title='Edad (años)',
+            yaxis_title='eGFR CKD-EPI 2021 (mL/min/1.73m²)',
+            height=450,margin=dict(l=10,r=10,t=20,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Comparación metodológica directa con Zúñiga 2011: Edad × MDRD-4")
+        st.caption("Este bloque recalcula eGFR con MDRD-4 clásico solo para comparar la correlación continua edad–eGFR con Zúñiga 2011. No cambia la definición principal del dashboard.")
+
+        sub_mdrd = df.dropna(subset=['Age','eGFR_MDRD4_Zuniga','eGFR'])
+        if len(sub_mdrd) >= 5:
+            rp_m, pp_m = pearsonr(sub_mdrd['Age'], sub_mdrd['eGFR_MDRD4_Zuniga'])
+            rs_m, ps_m = spearmanr(sub_mdrd['Age'], sub_mdrd['eGFR_MDRD4_Zuniga'])
+            lr_m = linregress(sub_mdrd['Age'], sub_mdrd['eGFR_MDRD4_Zuniga'])
+            lr_epi = linregress(sub_mdrd['Age'], sub_mdrd['eGFR'])
+
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Pearson r MDRD-4", f"{rp_m:.3f}", "Zúñiga: r = –0,54")
+            c2.metric("Spearman ρ MDRD-4", f"{rs_m:.3f}")
+            c3.metric("Pendiente MDRD-4", f"{lr_m.slope:.2f}", "mL/min/1.73m² por año")
+            c4.metric("Diferencia vs CKD-EPI", f"{rp_m - rp_v:+.3f}", "Δ Pearson r")
+
+            samp_m = sub_mdrd.sample(min(800, len(sub_mdrd)), random_state=42)
+            x_r_m = np.linspace(samp_m['Age'].min(), samp_m['Age'].max(), 100)
+
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=sub['mean'], y=sub['delta'], mode='markers',
-                marker=dict(color=C_MAIN, size=8, line=dict(color='white', width=1)),
-                hovertemplate='Media: %{x:.0f}<br>Δ: %{y:.1f}<extra></extra>'
+                x=samp_m['Age'], y=samp_m['eGFR_MDRD4_Zuniga'], mode='markers',
+                marker=dict(color=C_TEAL, size=5, opacity=0.45),
+                name='MDRD-4',
+                hovertemplate='Edad %{x}<br>MDRD-4 %{y:.0f}<extra></extra>'
             ))
-            fig.add_hline(y=bias, line_color='black',
-                          annotation_text=f'bias={bias:.1f}')
-            fig.add_hline(y=loa_hi, line_color=C_ACC, line_dash='dash',
-                          annotation_text=f'+1.96 DE = {loa_hi:.1f}')
-            fig.add_hline(y=loa_lo, line_color=C_ACC, line_dash='dash',
-                          annotation_text=f'-1.96 DE = {loa_lo:.1f}')
+            fig.add_trace(go.Scatter(
+                x=x_r_m, y=lr_m.slope*x_r_m + lr_m.intercept, mode='lines',
+                line=dict(color=C_MAIN, width=2.8),
+                name=f'MDRD-4: r={rp_m:.3f}'
+            ))
+            fig.add_trace(go.Scatter(
+                x=x_r_m, y=lr_epi.slope*x_r_m + lr_epi.intercept, mode='lines',
+                line=dict(color=C_ACC, width=2.2, dash='dash'),
+                name=f'CKD-EPI 2021: r={rp_v:.3f}'
+            ))
+            fig.add_hline(y=60, line_color=C_GRAY, line_dash='dot', annotation_text='eGFR 60')
             fig.update_layout(
-                xaxis_title='Promedio (1ra+2da)/2',
-                yaxis_title='Δ eGFR (2da - 1ra)',
-                height=400, margin=dict(l=10, r=10, t=20, b=20)
+                xaxis_title='Edad (años)',
+                yaxis_title='eGFR (mL/min/1.73m²)',
+                height=450, margin=dict(l=10,r=10,t=20,b=20),
+                legend=dict(orientation='h', y=1.08)
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        sub['ckd_1'] = (sub['eGFR_1st']<60).fillna(False).astype(int)
-        sub['ckd_2'] = (sub['eGFR_2nd']<60).fillna(False).astype(int)
-        tab = pd.crosstab(
-            sub['ckd_1'].map({0:'≥60 (1ra)',1:'<60 (1ra)'}),
-            sub['ckd_2'].map({0:'≥60 (2da)',1:'<60 (2da)'}),
-            margins=True
-        )
-        st.markdown("### Reclasificación binaria (eGFR < 60)")
-        st.dataframe(tab, use_container_width=True)
+            comp = pd.DataFrame([
+                {'Ecuación':'CKD-EPI 2021', 'N':len(sub_mdrd), 'Pearson r':rp_v, 'Spearman ρ':rs_v, 'Pendiente/año':lr_epi.slope},
+                {'Ecuación':'MDRD-4 tipo Zúñiga', 'N':len(sub_mdrd), 'Pearson r':rp_m, 'Spearman ρ':rs_m, 'Pendiente/año':lr_m.slope},
+                {'Ecuación':'Zúñiga 2011 reportado', 'N':'27.894', 'Pearson r':-0.54, 'Spearman ρ':np.nan, 'Pendiente/año':np.nan},
+            ])
+            st.dataframe(comp, use_container_width=True, hide_index=True)
+            st.info(
+                "Lectura: esta comparación usa la misma familia de ecuación reportada por Zúñiga "
+                "—MDRD-4 con factor 0,742 en mujeres— para que la correlación edad–eGFR sea metodológicamente más comparable. "
+                "La línea CKD-EPI 2021 se conserva como referencia interna del dashboard."
+            )
+        else:
+            st.warning("No hay datos suficientes para calcular la comparación MDRD-4.")
 
+    elif sub_t == "U invertida KDIGO":
+        st.markdown("### 'U invertida': edad media por estadio KDIGO G — Walbaum 2020")
+        st.info("La edad media sube al avanzar el estadio hasta G3b, luego cae en G4–G5 por mortalidad selectiva: los adultos mayores con ERC avanzada no llegan al tamizaje.")
+        ui_rows=[]
+        for g in ['G1','G2','G3a','G3b','G4','G5']:
+            sv=df[df['KDIGO_G']==g]['Age'].dropna()
+            if len(sv)<3: continue
+            se=sv.sem()
+            ui_rows.append({'Estadio':g,'N':len(sv),'Edad media':round(sv.mean(),1),
+                            'IC inf':round(sv.mean()-1.96*se,1),
+                            'IC sup':round(sv.mean()+1.96*se,1),'DE':round(sv.std(),1)})
+        if ui_rows:
+            udf=pd.DataFrame(ui_rows)
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(
+                x=udf['Estadio'],y=udf['Edad media'],mode='lines+markers+text',
+                error_y=dict(type='data',
+                    array=udf['IC sup']-udf['Edad media'],
+                    arrayminus=udf['Edad media']-udf['IC inf']),
+                line=dict(color=C_MAIN,width=2.5),
+                marker=dict(color=[KDIGO_COLORS[g] for g in udf['Estadio']],size=14,
+                            line=dict(color='white',width=2)),
+                text=[f"{m:.1f}" for m in udf['Edad media']],
+                textposition='top center'))
+            fig.update_layout(xaxis_title='Estadio KDIGO G',
+                yaxis_title='Edad media (años)',
+                height=420,margin=dict(l=10,r=10,t=30,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(udf, use_container_width=True, hide_index=True)
+
+    elif sub_t == "Etiología presuntiva":
+        st.markdown("### Etiología presuntiva de la ERC detectada — Poblete 2024")
+        st.info("Clasificación operacional basada en antecedentes clínicos. Referencia nacional (HDC 2024): nefropatía diabética 36,3%, nefroesclerosis HTA 14,8%, causa desconocida 5,5%.")
+        ckd_e=df[df['CKD60']==1].copy()
+        ckd_e['DM_any']=(ckd_e['DM_sr']==1)|(ckd_e['Glc200']==1)
+        ckd_e['HTA_any']=(ckd_e['HTA_sr']==1)|(ckd_e['HTA_meas']==1)
+        def etio(r):
+            dm=r['DM_any']; hta=r['HTA_any']
+            if dm and hta: return 'DM + HTA'
+            if dm: return 'Solo DM'
+            if hta: return 'Solo HTA'
+            return 'Origen incierto'
+        ckd_e['etio']=ckd_e.apply(etio,axis=1)
+        ec=ckd_e['etio'].value_counts()
+        fig=go.Figure(go.Pie(
+            labels=ec.index,values=ec.values,
+            marker=dict(colors=[C_ACC,'#F4E04D','#F08C5A',C_GRAY]),
+            hole=0.4,textinfo='label+percent+value',textposition='outside'))
+        fig.update_layout(height=420,margin=dict(l=10,r=10,t=20,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+        rows_et=[]
+        for e in ['DM + HTA','Solo HTA','Solo DM','Origen incierto']:
+            n=int((ckd_e['etio']==e).sum()); N=len(ckd_e)
+            p,lo,hi=wilson(n,N)
+            rows_et.append({'Etiología presuntiva':e,'n':n,'%':f"{p:.1f}%",
+                            'IC95%':f"{lo:.1f}–{hi:.1f}"})
+        st.dataframe(pd.DataFrame(rows_et), use_container_width=True, hide_index=True)
+
+    elif sub_t == "Interacción DM × HTA":
+        st.markdown("### Interacción DM × HTA — Walbaum 2020")
+        st.info("Walbaum 2020 reportó OR 2,30 para la combinación DM+HTA vs DM sola sobre albuminuria.")
+        combis=[('Ni HTA ni DM',(df['HTA_sr']==0)&(df['DM_sr']==0)),
+                ('Solo HTA',(df['HTA_sr']==1)&(df['DM_sr']==0)),
+                ('Solo DM',(df['HTA_sr']==0)&(df['DM_sr']==1)),
+                ('HTA + DM',(df['HTA_sr']==1)&(df['DM_sr']==1))]
+        rows_int=[]
+        for lbl,mask in combis:
+            sv=df[mask.fillna(False)].dropna(subset=['CKD60'])
+            n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+            p,lo,hi=wilson(n,N)
+            rows_int.append({'Combinación':lbl,'N':N,'n ERC':n,
+                             'Prev %':round(p,1),'lo':lo,'hi':hi})
+        rdf_int=pd.DataFrame(rows_int)
+        fig=go.Figure()
+        colors_int=[C_OK,'#FFDD00',C_TEAL,C_ACC]
+        fig.add_trace(go.Bar(x=rdf_int['Combinación'],y=rdf_int['Prev %'],
+            error_y=dict(type='data',array=rdf_int['hi']-rdf_int['Prev %'],
+                         arrayminus=rdf_int['Prev %']-rdf_int['lo']),
+            marker_color=colors_int,
+            text=[f"{p:.1f}%<br>n={N}" for p,N in zip(rdf_int['Prev %'],rdf_int['N'])],
+            textposition='outside'))
+        fig.update_layout(yaxis_title='Prevalencia eGFR<60 (%)',
+            height=400,margin=dict(l=10,r=10,t=30,b=20))
+        st.plotly_chart(fig, use_container_width=True)
         try:
-            n00 = ((sub['ckd_1']==0)&(sub['ckd_2']==0)).sum()
-            n11 = ((sub['ckd_1']==1)&(sub['ckd_2']==1)).sum()
-            n01 = ((sub['ckd_1']==0)&(sub['ckd_2']==1)).sum()
-            n10 = ((sub['ckd_1']==1)&(sub['ckd_2']==0)).sum()
-            N = n00+n01+n10+n11
-            po = (n00+n11)/N
-            pe = ((n00+n01)*(n00+n10) + (n10+n11)*(n01+n11)) / N**2
-            kappa = (po-pe)/(1-pe) if (1-pe) != 0 else np.nan
-            st.caption(f"**Kappa de Cohen = {kappa:.3f}** "
-                       f"(<0.20 pobre, 0.21–0.40 leve, 0.41–0.60 moderada, 0.61–0.80 sustancial, >0.80 casi perfecta)")
-        except Exception:
-            pass
+            dat_int=df[['CKD60','Age','Sex_M','PPOO_n','Obesity','HTA_sr','DM_sr',
+                        'FamHx_ERC','prot_pos']].dropna().copy()
+            dat_int['ckd']=dat_int['CKD60'].fillna(0).astype(int)
+            dat_int['htadm']=dat_int['HTA_sr']*dat_int['DM_sr']
+            m1=smf.logit('ckd~Age+Sex_M+PPOO_n+Obesity+HTA_sr+DM_sr+FamHx_ERC+prot_pos',
+                          data=dat_int).fit(disp=0)
+            m2=smf.logit('ckd~Age+Sex_M+PPOO_n+Obesity+HTA_sr+DM_sr+htadm+FamHx_ERC+prot_pos',
+                          data=dat_int).fit(disp=0)
+            or_int=np.exp(m2.params['htadm'])
+            ci_int=(np.exp(m2.conf_int().loc['htadm',0]),
+                    np.exp(m2.conf_int().loc['htadm',1]))
+            pv_int=m2.pvalues['htadm']
+            c1,c2,c3=st.columns(3)
+            c1.metric("OR interacción HTA×DM",f"{or_int:.2f}")
+            c2.metric("IC95%",f"{ci_int[0]:.2f}–{ci_int[1]:.2f}")
+            c3.metric("p",f"{pv_int:.4f}")
+            st.caption(f"AIC sin interacción={m1.aic:.1f} | con interacción={m2.aic:.1f}")
+        except Exception as e:
+            st.warning(f"No se pudo ajustar modelo de interacción: {e}")
+
+    elif sub_t == "AINEs y función renal":
+        st.markdown("### AINEs y función renal — orientación nefróloga")
+        st.info("Consumo de AINEs en pacientes con ERC no diagnosticada = nefrotoxicidad evitable. Relevancia clínica directa para prescripción segura en terreno.")
+        if df['AINEs_diario_modelo'].notna().sum() < 20:
+            # Use raw Consumo AINEs
+            if 'Consumo AINEs' in df.columns:
+                cats=df['Consumo AINEs'].value_counts()
+                cat_order=['Nunca','Cuando sea necesario','Unas pocas al mes',
+                           '1-4 al día','5-10 al día']
+                cat_order=[c for c in cat_order if c in cats.index]
+                aines_prev=[]
+                for c in cat_order:
+                    sv=df[df['Consumo AINEs']==c].dropna(subset=['CKD60'])
+                    n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+                    p,lo,hi=wilson(n,N)
+                    aines_prev.append({'Categoría':c,'N':N,'n ERC':n,
+                                       'Prev %':round(p,1),'lo':lo,'hi':hi})
+        else:
+            aines_map_r={
+                'AINEs_NoUso_Reportado':'No uso reportado',
+                'AINEs_Uso_PRN_NoCuantificado':'Uso PRN (sin cuantificar)',
+                'AINEs_Uso_OcasionalMensual':'Uso ocasional mensual',
+                'AINEs_Uso_Diario':'Uso diario (1-4/día)',
+                'AINEs_Uso_Diario_Alto_5a10':'Uso diario alto (5-10/día)',
+            }
+            aines_prev=[]
+            for col,lbl in aines_map_r.items():
+                if col not in df.columns: continue
+                sv=df[df[col]==1].dropna(subset=['CKD60'])
+                if len(sv)<5: continue
+                n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+                p,lo,hi=wilson(n,N)
+                aines_prev.append({'Categoría':lbl,'N':N,'n ERC':n,
+                                   'Prev %':round(p,1),'lo':lo,'hi':hi})
+
+        if aines_prev:
+            adf=pd.DataFrame(aines_prev)
+            cols_a=['#4DAF4A','#FFDD00','#F28F00','#E83800','#9E0000'][:len(adf)]
+            fig=go.Figure()
+            fig.add_trace(go.Bar(x=adf['Categoría'],y=adf['Prev %'],
+                marker_color=cols_a,
+                error_y=dict(type='data',array=adf['hi']-adf['Prev %'],
+                             arrayminus=adf['Prev %']-adf['lo'])))
+            anns_a=bar_annotations(adf['Categoría'].tolist(),adf['Prev %'].tolist(),
+                adf['hi'].tolist(),
+                [f"{p:.1f}%<br>n={N}" for p,N in zip(adf['Prev %'],adf['N'])])
+            pglobal=wilson(int((df['CKD60']==1).sum()),int(df['CKD60'].notna().sum()))[0]
+            if pd.notna(pglobal):
+                fig.add_hline(y=pglobal,line_dash='dash',line_color='black',
+                              annotation_text=f"Global {pglobal:.1f}%")
+            fig.update_layout(yaxis_title='Prevalencia eGFR<60 (%)',
+                annotations=anns_a,
+                yaxis=dict(range=[0, adf['hi'].max()*1.45 if len(adf) else 30]),
+                height=400,margin=dict(l=10,r=10,t=50,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(adf, use_container_width=True, hide_index=True)
+        else:
+            st.warning("No hay datos suficientes de AINEs en la muestra filtrada.")
+
+        # ERC oculta + AINEs
+        eo=df[(df['CKD60']==1)&(df['Creatinine_1st']<=1.0)]
+        if len(eo)>0:
+            uso_eo=int((eo['AINEs_diario_modelo']==1).sum()) if df['AINEs_diario_modelo'].notna().sum()>0 else 0
+            st.info(f"**ERC oculta con uso de AINEs:** {uso_eo}/{len(eo)} casos de ERC oculta "
+                    f"reportan uso de AINEs — riesgo de nefrotoxicidad en pacientes con "
+                    f"creatinina aparentemente normal.")
+
+    elif sub_t == "Subdiagnóstico en HTA/DM (PSCV proxy)":
+        st.markdown("### Subdiagnóstico de ERC en proxy PSCV — Zúñiga 2011")
+        st.info("Personas con HTA y/o DM autoreportada ≈ candidatos al PSCV. Zúñiga 2011: solo 1,1% de pacientes con ERC dentro del PSCV tenían el diagnóstico de ERC consignado en ficha.")
+        pscv=df[(df['HTA_sr']==1)|(df['DM_sr']==1)]
+        pscv_ckd=pscv[pscv['CKD60']==1]
+        tto=pscv_ckd[pscv_ckd['TTO_ERC_b'].notna()]
+        n_tto=len(tto); n_kno=int((tto['TTO_ERC_b']==1).sum())
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("N proxy PSCV",f"{len(pscv):,}")
+        c2.metric("ERC en PSCV",f"{len(pscv_ckd)}",
+                  f"{len(pscv_ckd)/len(pscv)*100:.1f}%")
+        c3.metric("Con TTO_ERC disponible",f"{n_tto}")
+        c4.metric("% sin diagnóstico previo",
+                  f"{(n_tto-n_kno)/n_tto*100:.1f}%" if n_tto else "—",
+                  help="Sobre los que tienen dato disponible")
+
+        # Pirámide PSCV vs no-PSCV
+        rows_pscv=[]
+        for g in ['<30','30-44','45-59','60-74','≥75']:
+            for grp_l,grp_m in [('PSCV',pscv),('No PSCV',df[~df.index.isin(pscv.index)])]:
+                sv=grp_m[grp_m['Age_grp']==g].dropna(subset=['CKD60'])
+                if len(sv)<5: continue
+                n=int((sv['CKD60']==1).sum()); N=int(len(sv))
+                p,lo,hi=wilson(n,N)
+                rows_pscv.append({'Edad':g,'Grupo':grp_l,'Prev':p,'N':N})
+        if rows_pscv:
+            pdf2=pd.DataFrame(rows_pscv)
+            fig=px.bar(pdf2,x='Edad',y='Prev',color='Grupo',barmode='group',
+                color_discrete_map={'PSCV':C_ACC,'No PSCV':C_LIGHT},
+                category_orders={'Edad':['<30','30-44','45-59','60-74','≥75']},
+                hover_data=['N'])
+            fig.update_layout(yaxis_title='Prevalencia eGFR<60 (%)',
+                height=400,margin=dict(l=10,r=10,t=20,b=20))
+            st.plotly_chart(fig, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════
-# TAB 8 — DATOS
+# TAB 9 — DATOS
 # ═══════════════════════════════════════════════════════════
 with tab_data:
     st.header("Datos filtrados")
-    st.caption(f"N actualmente seleccionado: **{len(df):,}**")
+    st.caption(f"N seleccionado: **{len(df):,}**")
 
-    cols_show = st.multiselect(
-        "Columnas a mostrar",
-        options=df.columns.tolist(),
-        default=['ID','Age','Sex_lbl','Community','PPOO_lbl','BMI',
-                 'BP_Final','eGFR_1st','CKD_KDIGO_G','Albuminuria_cat',
-                 'KDIGO_risk']
-    )
+    default_cols=['ID','Age','Sex_lbl','Community_std','PPOO_lbl','BMI_cat',
+                  'BP_Final','eGFR','KDIGO_G','Alb_cat','KDIGO_risk',
+                  'CKD60','prot_pos','AINEs_diario_modelo','FamHx_ERC']
+    default_cols=[c for c in default_cols if c in df.columns]
+    cols_show=st.multiselect("Columnas a mostrar", df.columns.tolist(),
+                              default=default_cols)
     if cols_show:
-        st.dataframe(df[cols_show], use_container_width=True, height=500)
-
-        csv = df[cols_show].to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "📥 Descargar selección (CSV)",
-            data=csv,
-            file_name='ckd_filtered.csv',
-            mime='text/csv'
-        )
+        st.dataframe(df[cols_show], use_container_width=True, height=520)
+        csv=df[cols_show].to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Descargar CSV",csv,'ckd_filtrado.csv','text/csv')
 
 st.markdown("---")
 st.caption(
-    "Estudio de prevalencia de ERC · Región de la Araucanía. "
-    "Las prevalencias aplican a la muestra de screening, no a la población general."
+    "Dashboard ERC Araucanía v4.0 · eGFR CKD-EPI 2021 · Planillas 01-05 · "
+    "Prevalencias aplican a la muestra de screening, no a la población general."
 )

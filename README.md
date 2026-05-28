@@ -1,55 +1,110 @@
 # Dashboard ERC Araucanía
 
-Dashboard interactivo para el análisis de prevalencia de ERC en la Región de la Araucanía.
+Dashboard interactivo en Streamlit para explorar la prevalencia de enfermedad renal crónica (ERC) en una muestra de pesquisa comunitaria de la Región de La Araucanía, Chile.
 
-## Instalación
+La aplicación utiliza eGFR CKD-EPI 2021, planillas curadas/estandarizadas y visualizaciones interactivas para describir prevalencia, estratificación, carga acumulada de factores de riesgo, asociaciones crudas/ajustadas y concordancia entre definiciones.
+
+## Archivos principales
+
+La estructura recomendada del repositorio es:
+
+```text
+.
+├── app_v4.2.13.py
+├── requirements.txt
+├── README.md
+├── CKD_DATA_v3_3.xlsx
+├── 01 - Variable ¿Cual otra condición de salud?.xlsx
+├── 02 - Variable Otros Antec Fliares OK.xlsx
+├── 03 - consumo_AINEs_estandarizado_variables_modelo.xlsx
+├── 04 - otros_diagnosticos_estandarizados_variables_modelo ok.xlsx
+└── 05 - evaluacion_medica_estandarizada_variables_modelo.xlsx
+```
+
+También puedes renombrar `app_v4.2.13.py` a `app.py` si prefieres un nombre más simple para Streamlit.
+
+## Archivos de datos esperados
+
+La app puede cargar archivos de dos formas:
+
+1. **Carga automática** desde la carpeta del repositorio.
+2. **Carga manual** desde el panel lateral de Streamlit.
+
+Para la carga automática, la app busca la base principal con uno de estos nombres:
+
+```text
+CKD_DATA_v3_3.xlsx
+CKD_DATA_v3.3.xlsx
+```
+
+Las planillas complementarias 01–05 se detectan mediante patrones de nombre. Se recomienda mantener nombres que comiencen con `01`, `02`, `03`, `04` y `05`, respectivamente.
+
+## Instalación local
+
+Crea un entorno virtual e instala las dependencias:
 
 ```bash
-# 1. Crear entorno (recomendado)
-python3 -m venv venv
-source venv/bin/activate
-
-# 2. Instalar dependencias
+python -m venv .venv
+source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
-## Cómo correr
+En Windows:
 
-Coloca `CKD_DATA_v2.xlsx` en la misma carpeta que `app.py` y ejecuta:
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Ejecución local
+
+Si el archivo principal se mantiene como `app_v4.2.13.py`:
+
+```bash
+streamlit run app_v4.2.13.py
+```
+
+Si lo renombras como `app.py`:
 
 ```bash
 streamlit run app.py
 ```
 
-Se abrirá automáticamente en tu navegador (http://localhost:8501).
+## Publicación en Streamlit Community Cloud
 
-Si prefieres subir el archivo desde la app, simplemente corre `streamlit run app.py` sin el xlsx y usa el uploader del sidebar.
+1. Sube este repositorio a GitHub.
+2. Verifica que `requirements.txt` esté en la raíz del repositorio.
+3. En Streamlit Community Cloud, selecciona:
+   - Repository: el repositorio de GitHub.
+   - Branch: la rama principal, por ejemplo `main`.
+   - Main file path: `app_v4.2.13.py` o `app.py`, según el nombre usado.
+4. Selecciona una versión de Python compatible, idealmente Python 3.11 o 3.12.
+5. Despliega la aplicación.
 
-## Filtros disponibles
+## Dependencias
 
-**En el sidebar (afectan a todas las pestañas):**
-- Rango de edad (slider)
-- Comunas (multiselect, default: todas)
-- Pueblo originario (PPOO / No PPOO)
-- Sexo (Mujer / Hombre)
-- Estado nutricional (bajo peso / peso normal / sobrepeso / obeso)
-- HTA autoreportada (todos / solo conocida / solo sin conocer)
-- DM autoreportada (todos / solo conocida / solo sin conocer)
+Las dependencias principales son:
 
-## Pestañas
+- Streamlit
+- pandas
+- NumPy
+- Plotly
+- SciPy
+- statsmodels
+- scikit-learn
+- openpyxl
 
-1. **🏠 Resumen** — Características generales, prevalencias principales, pirámide etaria, distribución eGFR
-2. **📊 Prevalencia** — Prevalencias por definición, estadios KDIGO, matriz eGFR×Albuminuria
-3. **🔬 Estratificación** — Prevalencia por variable a elegir + comparación PPOO×edad
-4. **👥 Subgrupos** — Carga acumulada de factores, combinaciones clínicas
-5. **⚠️ Factores de riesgo** — RR crudo (forest plot) y regresión logística multivariada
-6. **📈 Score de riesgo** — Performance del score, ROC, calculadora individual
-7. **🔄 Concordancia** — eGFR 1ra vs 2da toma, Bland-Altman, reclasificación
-8. **📋 Datos** — Vista tabular y descarga de la muestra filtrada como CSV
+`openpyxl` es necesario para que pandas pueda leer archivos `.xlsx`.
 
-## Notas
+## Consideraciones de privacidad
 
-- Los cálculos se actualizan automáticamente al cambiar los filtros.
-- Los IC95% se calculan con método Wilson para proporciones.
-- La regresión logística se reajusta sobre la muestra filtrada; si N es insuficiente la pestaña avisa.
-- Todos los gráficos son interactivos (zoom, hover, descarga PNG desde el menú del gráfico).
+Este proyecto trabaja con información de salud. Antes de subir planillas a GitHub o publicar la app, confirma que los datos estén anonimizados y que el repositorio tenga el nivel de privacidad adecuado.
+
+Si las planillas contienen datos sensibles o potencialmente identificables, usa un repositorio privado y evita publicar datos personales, identificadores directos o información clínica individual no anonimizada.
+
+## Nota metodológica
+
+La app calcula prevalencias con intervalos de confianza, estratificación por variables clínicas/demográficas, carga acumulada de factores de riesgo y razones de prevalencia crudas o ajustadas mediante modelos de Poisson con varianza robusta cuando corresponde.
+
+Los resultados son descriptivos/exploratorios y deben interpretarse considerando el diseño transversal de la muestra de pesquisa.
