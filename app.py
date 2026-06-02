@@ -185,7 +185,7 @@ def pairwise_categorical_posthoc(df, group, outcome, min_n=5):
                 p = stats.fisher_exact(tab)[1] if method == 'Fisher' else p_chi
                 pa = tmp.loc[tmp[group]==a, outcome].mean()*100
                 pb = tmp.loc[tmp[group]==b, outcome].mean()*100
-                rows.append({'Comparación':f'{a} vs {b}', 'Δ prevalencia pp':pa-pb,
+                rows.append({'Comparación':f'{a} vs {b}', 'Δ positividad pp':pa-pb,
                              'p':p, 'Método':method})
             except Exception:
                 pass
@@ -485,7 +485,7 @@ def add_rural_binary(df):
     return df
 
 
-def plot_pr_forest(pr_df, title_x='Razón de prevalencias (escala log)'):
+def plot_pr_forest(pr_df, title_x='Razón de positividad (escala log)'):
     fig = go.Figure()
     if pr_df is None or len(pr_df) == 0:
         return fig
@@ -1084,9 +1084,9 @@ st.caption("Dashboard interactivo v4.2.14 · eGFR CKD-EPI 2021 · Muestra de scr
 # ═══════════════════════════════════════════════════════════
 (tab_overview, tab_prev, tab_strat, tab_subgrp,
  tab_risk, tab_score, tab_concord, tab_lit, tab_data, tab_mrp) = st.tabs([
-    "🏠 Resumen", "📊 Prevalencia", "🔬 Estratificación",
+    "🏠 Resumen", "📊 Pesquisa ERC", "🔬 Estratificación",
     "🧩 Carga de riesgo", "⚠️ Factores riesgo", "📈 Score",
-    "🔄 Concordancia", "📖 Literatura", "📋 Datos", "🗺️ MRP regional",
+    "🔄 Concordancia", "📖 Literatura", "📋 Datos", "🗺️ Prevalencia modelada",
 ])
 
 # ═══════════════════════════════════════════════════════════
@@ -1199,17 +1199,17 @@ with tab_overview:
             text=[f"{p:.1f}%" if pd.notna(p) else "" for p in bmi_prev],
             textposition='top center'), secondary_y=True)
         fig.update_yaxes(title_text="N pacientes", secondary_y=False)
-        fig.update_yaxes(title_text="Prevalencia ERC (%)", secondary_y=True)
+        fig.update_yaxes(title_text="Positividad ERC (%)", secondary_y=True)
         fig.update_layout(height=370, margin=dict(l=10,r=10,t=10,b=20),
                           legend=dict(orientation='h',y=1.08))
         st.plotly_chart(fig, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════
-# TAB 2 — PREVALENCIA
+# TAB 2 — PESQUISA ERC
 # ═══════════════════════════════════════════════════════════
 with tab_prev:
-    st.header("Prevalencia de ERC — definiciones operacionales")
+    st.header("Positividad observada de ERC — definiciones operacionales")
 
     rows=[]
     for lbl,var in [
@@ -1223,7 +1223,7 @@ with tab_prev:
         rows.append([lbl,n,N,f"{p:.1f}%" if pd.notna(p) else "—",
                      f"{l:.1f}–{h:.1f}" if pd.notna(l) else "—"])
     st.dataframe(pd.DataFrame(rows,
-        columns=['Definición','n','N','Prevalencia','IC95%']),
+        columns=['Definición','n','N','Positividad','IC95%']),
         use_container_width=True, hide_index=True)
 
     # Comparación ecuaciones
@@ -1279,7 +1279,7 @@ with tab_prev:
             ['Muy alto','Muy alto','Muy alto'],['Muy alto','Muy alto','Muy alto'],
         ], index=tab_m.index, columns=tab_m.columns)
 
-        # Color = categoría de riesgo KDIGO; intensidad = prevalencia de la celda.
+        # Color = categoría de riesgo KDIGO; intensidad = positividad de la celda.
         total_m = tab_m.values.sum()
         pct_m = tab_m / total_m * 100 if total_m else tab_m.astype(float)
         max_pct = pct_m.values.max() if total_m else 0
@@ -1313,7 +1313,7 @@ with tab_prev:
                          title='Estadio eGFR', autorange='reversed', showgrid=False, zeroline=False)
         fig.update_layout(height=400, margin=dict(l=10,r=10,t=10,b=20), plot_bgcolor='white')
         st.plotly_chart(fig, use_container_width=True)
-        st.caption('Color base según riesgo KDIGO; intensidad proporcional a la prevalencia dentro de la matriz. Celdas sin datos quedan en blanco.')
+        st.caption('Color base según riesgo KDIGO; intensidad proporcional a la positividad dentro de la matriz. Celdas sin datos quedan en blanco.')
 
 
 
@@ -1321,7 +1321,7 @@ with tab_prev:
 # TAB 3 — ESTRATIFICACIÓN
 # ═══════════════════════════════════════════════════════════
 with tab_strat:
-    st.header("Prevalencia estratificada")
+    st.header("Positividad observada de ERC estratificada")
 
     c_ctrl, c_plot = st.columns([1,3])
     with c_ctrl:
@@ -1345,7 +1345,7 @@ with tab_strat:
             format_func=lambda x: 'Estricta (CKD-EPI 2021 <60)' if x=='CKD60'
                                   else 'Ampliada (incl. proteinuria)')
         min_n = st.number_input("N mínimo", 1, 100, 5)
-        st.caption("La segunda variable muestra barras agrupadas en paralelo para comparar prevalencia por subgrupo.")
+        st.caption("La segunda variable muestra barras agrupadas en paralelo para comparar positividad por subgrupo.")
 
     with c_plot:
         group_cols = [var_s] if var2_s == '(Ninguna)' else [var_s, var2_s]
@@ -1375,7 +1375,7 @@ with tab_strat:
                     marker_color=C_MAIN))
                 labels_s=[f"{p:.1f}%<br>(n={int(N)})" for p,N in zip(grp['prev'],grp['N'])]
                 anns_s=bar_annotations(grp[var_s].astype(str).tolist(), grp['prev'].tolist(), grp['hi'].tolist(), labels_s)
-                fig.update_layout(yaxis_title='Prevalencia ERC (%)',
+                fig.update_layout(yaxis_title='Positividad ERC (%)',
                     height=420, margin=dict(l=10,r=10,t=50,b=20),
                     showlegend=False, annotations=anns_s,
                     yaxis=dict(range=[0, max(grp['hi'].max()*1.35, 5)]))
@@ -1386,7 +1386,7 @@ with tab_strat:
                     note = f" · {test['note']}" if test.get('note') else ""
                     st.caption(f"**Test global:** {test['method']}, p = {format_p(test['p'])} "
                                f"{'✓ diferencias entre grupos' if test['p']<0.05 else '✗ sin evidencia de diferencias'}{note}. "
-                               "Como el desenlace es binario, se comparan proporciones; la prevalencia graficada es el resumen por grupo.")
+                               "Como el desenlace es binario, se comparan proporciones; la positividad graficada es el resumen por grupo.")
                     ph = pairwise_categorical_posthoc(sub, var_s, outcome_s, min_n=min_n)
                     if test['p'] < 0.05 and len(ph):
                         sig_ph = ph[ph['Significativo']].copy()
@@ -1401,7 +1401,7 @@ with tab_strat:
                 if pd.notna(test.get('p', np.nan)) and test['p'] < 0.05:
                     ph_show = pairwise_categorical_posthoc(sub, var_s, outcome_s, min_n=min_n)
                     if len(ph_show):
-                        ph_show['Δ prevalencia pp'] = ph_show['Δ prevalencia pp'].round(1)
+                        ph_show['Δ positividad pp'] = ph_show['Δ positividad pp'].round(1)
                         ph_show['p'] = ph_show['p'].round(4)
                         ph_show['p ajustado Holm'] = ph_show['p ajustado Holm'].round(4)
                         st.markdown("**Comparaciones post hoc entre grupos**")
@@ -1451,7 +1451,7 @@ with tab_strat:
                             hovertemplate=(
                                 f"{var_opts.get(var_s, var_s)}: %{{x}}<br>"
                                 f"{var_opts.get(var2_s, var2_s)}: {level}<br>"
-                                "Prevalencia: %{y:.1f}%<br>"
+                                "Positividad: %{y:.1f}%<br>"
                                 "N: %{customdata[0]}<br>"
                                 "n ERC: %{customdata[1]}<br>"
                                 "IC95% sup.: %{customdata[2]:.1f}%"
@@ -1488,7 +1488,7 @@ with tab_strat:
 
                     fig.update_layout(
                         barmode='group',
-                        yaxis_title='Prevalencia ERC (%)',
+                        yaxis_title='Positividad ERC (%)',
                         xaxis_title=var_opts.get(var_s, var_s),
                         height=520,
                         margin=dict(l=10, r=10, t=95, b=70),
@@ -1529,12 +1529,12 @@ with tab_strat:
                     error_y=pdf['hi']-pdf['prev'],
                     category_orders={'Edad':['<30','30-44','45-59','60-74','≥75']},
                     hover_data=['N'], title=f"Definición {lbl_v}")
-                fig.update_layout(yaxis_title='Prevalencia (%)',
+                fig.update_layout(yaxis_title='Positividad (%)',
                     height=380, margin=dict(l=10,r=10,t=30,b=20))
                 col.plotly_chart(fig, use_container_width=True)
 
     # Ruralidad + comunas
-    st.markdown("### Prevalencia comunal y ruralidad")
+    st.markdown("### Positividad comunal y ruralidad")
     com_data=[]
     for com in all_comms:
         sv=df[df['Community_std']==com].dropna(subset=['CKD60'])
@@ -1557,8 +1557,8 @@ with tab_strat:
             textposition='outside',
             hovertemplate='%{x}<br>ERC: %{y:.1f}%<extra></extra>'))
         fig.update_layout(
-            xaxis_title='% Prevalencia ERC (% Ruralidad de la comuna)',
-            yaxis_title='Prevalencia eGFR<60 (%)',
+            xaxis_title='% Positividad ERC (% Ruralidad de la comuna)',
+            yaxis_title='Positividad eGFR<60 (%)',
             height=420, margin=dict(l=10,r=10,t=10,b=60),
             annotations=[dict(text='🟫 Rural ≥30%  🔵 Urbano <30%',
                 x=0.5,y=-0.20,xref='paper',yref='paper',showarrow=False,
@@ -1636,7 +1636,7 @@ with tab_subgrp:
                 customdata=sdf[['Score', 'N', 'n ERC', 'lo', 'hi']].astype(str).values,
                 hovertemplate=(
                     'N° factores: %{customdata[0]}<br>'
-                    'Prevalencia: %{y:.1f}%<br>'
+                    'Positividad: %{y:.1f}%<br>'
                     'N: %{customdata[1]}<br>'
                     'n ERC: %{customdata[2]}<br>'
                     'IC95%: %{customdata[3]}–%{customdata[4]}<extra></extra>'
@@ -1653,7 +1653,7 @@ with tab_subgrp:
             y_max_rf = max(float(sdf['hi'].max()) * 1.35, 5)
             fig.update_layout(
                 xaxis_title='N° factores de riesgo presentes',
-                yaxis_title='Prevalencia ERC (%)',
+                yaxis_title='Positividad ERC (%)',
                 annotations=anns_rf,
                 yaxis=dict(range=[0, y_max_rf]),
                 xaxis=dict(
@@ -1680,10 +1680,10 @@ with tab_subgrp:
             if pd.notna(test_rf['p']):
                 note = f" · {test_rf['note']}" if test_rf.get('note') else ""
                 st.caption(f"**Test global:** {test_rf['method']}, p = {format_p(test_rf['p'])} "
-                           f"{'✓ la prevalencia cambia con la carga de factores' if test_rf['p']<0.05 else '✗ sin evidencia de diferencias'}{note}.")
+                           f"{'✓ la Positividad cambia con la carga de factores' if test_rf['p']<0.05 else '✗ sin evidencia de diferencias'}{note}.")
                 ph_rf = pairwise_categorical_posthoc(sub, 'RF_lbl', 'CKD60', min_n=5)
                 if test_rf['p'] < 0.05 and len(ph_rf):
-                    ph_rf['Δ prevalencia pp'] = ph_rf['Δ prevalencia pp'].round(1)
+                    ph_rf['Δ Positividad pp'] = ph_rf['Δ Positividad pp'].round(1)
                     ph_rf['p'] = ph_rf['p'].round(4)
                     ph_rf['p ajustado Holm'] = ph_rf['p ajustado Holm'].round(4)
                     st.dataframe(style_sig(ph_rf), use_container_width=True, hide_index=True)
@@ -1712,7 +1712,7 @@ with tab_subgrp:
     # AINEs si está disponible
     # Nota: eGFR<60 NO se usa como criterio para definir subgrupos aquí,
     # porque CKD60 es el desenlace. Usarlo en la máscara produciría una
-    # prevalencia artificialmente igual a 100%.
+    # positividad artificialmente igual a 100%.
     if df['AINEs_diario_modelo'].notna().any():
         combos.append(("AINEs diarios",
                        (df['AINEs_diario_modelo'] == 1)))
@@ -1766,7 +1766,7 @@ with tab_subgrp:
             ))
 
         fig.update_layout(
-            xaxis_title='Prevalencia (%)',
+            xaxis_title='Positividad (%)',
             xaxis=dict(range=[0, xmax]),
             annotations=anns_c + global_ann,
             height=430,
@@ -1781,8 +1781,8 @@ with tab_subgrp:
 with tab_risk:
     st.header("Factores de riesgo")
     st.caption(
-        "Esta sección estima razones de prevalencia (RP) para ERC presuntiva definida como eGFR CKD-EPI 2021 <60. "
-        "En estudios transversales, la RP es más interpretable que un OR cuando la prevalencia no es rara."
+        "Esta sección estima razones de positividad (RP) para ERC presuntiva definida como eGFR CKD-EPI 2021 <60. "
+        "En estudios transversales, la RP es más interpretable que un OR cuando la positividad no es rara."
     )
 
     df = add_rural_binary(df)
@@ -1853,7 +1853,7 @@ with tab_risk:
 
     if len(pr_df):
         pr_df = pr_df.sort_values('RP', ascending=False).head(int(max_vars)).copy()
-        fig = plot_pr_forest(pr_df, title_x=f"Razón de prevalencias — {ajuste_sel.lower()} (escala log)")
+        fig = plot_pr_forest(pr_df, title_x=f"Razón de positividad — {ajuste_sel.lower()} (escala log)")
         st.plotly_chart(fig, use_container_width=True)
 
         tbl = pr_df[['Factor','Variable','N modelo','N expuestos','N no expuestos',
@@ -1865,7 +1865,7 @@ with tab_risk:
 
         if ajuste_sel == 'Crudo':
             st.caption(
-                "Estimación cruda: prevalencia de ERC en expuestos dividida por prevalencia de ERC en no expuestos. "
+                "Estimación cruda: positividad de ERC en expuestos dividida por positividad de ERC en no expuestos. "
                 "El IC95% usa aproximación logarítmica."
             )
         else:
@@ -1929,7 +1929,7 @@ with tab_risk:
 # TAB 6 — SCORE
 # ═══════════════════════════════════════════════════════════
 with tab_score:
-    st.header("Score clínico de riesgo para tamizaje")
+    st.header("Propuesta de Score clínico de riesgo para tamizaje")
     st.markdown("""
     **Score v4 — 4 variables | rango 0–8 puntos**
 
@@ -1962,7 +1962,7 @@ with tab_score:
                 textposition='top center'),secondary_y=True)
             fig.update_xaxes(title_text='Puntaje')
             fig.update_yaxes(title_text='N pacientes',secondary_y=False)
-            fig.update_yaxes(title_text='Prevalencia (%)',secondary_y=True,range=[0,100])
+            fig.update_yaxes(title_text='Positividad (%)',secondary_y=True,range=[0,100])
             fig.update_layout(height=400,margin=dict(l=10,r=10,t=30,b=20),
                               legend=dict(orientation='h',y=1.1))
             st.plotly_chart(fig, use_container_width=True)
@@ -1997,7 +1997,7 @@ with tab_score:
             n=int(sv['ckd'].sum()); N=int(len(sv))
             p,lo,hi=wilson(n,N)
             e_rows.append({'Estrato':e,'N':N,'n ERC':n,
-                           'Prevalencia %':f"{p:.1f}%",
+                           'Positividad %':f"{p:.1f}%",
                            'IC95%':f"{lo:.1f}–{hi:.1f}"})
         st.dataframe(pd.DataFrame(e_rows), use_container_width=True, hide_index=True)
 
@@ -2119,10 +2119,10 @@ with tab_concord:
 
 
 # ═══════════════════════════════════════════════════════════
-# TAB 8 — LITERATURA (análisis extra)
+# TAB 8 — LITERATURA (Comparación con análisis previamente publicados)
 # ═══════════════════════════════════════════════════════════
 with tab_lit:
-    st.header("Análisis derivados de la literatura nefrológica")
+    st.header("Análisis realizados previamente en trabajos publicados")
     st.caption("Zúñiga 2011 · Walbaum 2020 · Meneses 2023 · Poblete 2024")
 
     sub_t = st.radio("Selecciona análisis",
@@ -2150,13 +2150,13 @@ with tab_lit:
             n=int((sv['Creatinine_1st']<=1.0).sum()); N=int(sv['Creatinine_1st'].notna().sum())
             p2,lo2,hi2=wilson(n,N)
             rows_eo.append({'Subgrupo':sex,'n ERC oculta':n,'N eGFR<60':N,
-                            'Prevalencia':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
+                            'Positividad':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
         for g in ['<30','30-44','45-59','60-74','≥75']:
             sv=ckd_cases[ckd_cases['Age_grp']==g]
             n=int((sv['Creatinine_1st']<=1.0).sum()); N=int(sv['Creatinine_1st'].notna().sum())
             p2,lo2,hi2=wilson(n,N)
             rows_eo.append({'Subgrupo':f"Edad {g}",'n ERC oculta':n,'N eGFR<60':N,
-                            'Prevalencia':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
+                            'Positividad':f"{p2:.1f}%",'IC95%':f"{lo2:.1f}–{hi2:.1f}"})
         st.dataframe(pd.DataFrame(rows_eo), use_container_width=True, hide_index=True)
 
     elif sub_t == "Correlación eGFR-Edad":
@@ -2399,7 +2399,7 @@ with tab_lit:
             if pd.notna(pglobal):
                 fig.add_hline(y=pglobal,line_dash='dash',line_color='black',
                               annotation_text=f"Global {pglobal:.1f}%")
-            fig.update_layout(yaxis_title='Prevalencia eGFR<60 (%)',
+            fig.update_layout(yaxis_title='Positividad eGFR<60 (%)',
                 annotations=anns_a,
                 yaxis=dict(range=[0, adf['hi'].max()*1.45 if len(adf) else 30]),
                 height=400,margin=dict(l=10,r=10,t=50,b=20))
@@ -2447,7 +2447,7 @@ with tab_lit:
                 color_discrete_map={'PSCV':C_ACC,'No PSCV':C_LIGHT},
                 category_orders={'Edad':['<30','30-44','45-59','60-74','≥75']},
                 hover_data=['N'])
-            fig.update_layout(yaxis_title='Prevalencia eGFR<60 (%)',
+            fig.update_layout(yaxis_title='Positividad eGFR<60 (%)',
                 height=400,margin=dict(l=10,r=10,t=20,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
@@ -2473,5 +2473,5 @@ with tab_data:
 st.markdown("---")
 st.caption(
     "Dashboard ERC Araucanía v4.0 · eGFR CKD-EPI 2021 · Planillas 01-05 · "
-    "Prevalencias aplican a la muestra de screening, no a la población general."
+    "Positividad aplican a la muestra de screening, no a la población general."
 )
